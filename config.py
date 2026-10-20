@@ -97,9 +97,9 @@ SIGNAL_MIN_SCORE = 5
 MIN_CANDLES = 80
 KLINES_LIMIT = 200
 
-# MTF: hard gate on 4h+1h, soft score on lower TFs
-MTF_HARD = ("4h", "1h")
-MTF_WEIGHTS = {"4h": 0.30, "1h": 0.25, "30m": 0.20, "15m": 0.15, "5m": 0.10}
+# MTF: hard gate on 1h, weighted score over 1h/30m/15m/5m (user 2026-10-21)
+MTF_HARD = ("1h",)
+MTF_WEIGHTS = {"1h": 0.40, "30m": 0.25, "15m": 0.20, "5m": 0.15}
 MTF_MIN_SCORE = 0.70
 BTC_ALIGN = os.environ.get("BTC_ALIGN", "1").strip().lower() not in ("0", "false", "no", "off")
 

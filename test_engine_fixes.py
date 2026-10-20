@@ -1,8 +1,9 @@
 """Engine fix tests (bug-hunt round 2) — no network.
 
-Covers: MTF weighted score excludes the signal's own 15m leg (it can
-now actually reject), and market.get_klines drops the still-forming
-last candle so analysis never repaints.
+Covers: MTF set 1h/30m/15m/5m (user config 2026-10-21) — hard gate on
+1h, weighted score that can still reject when both soft legs oppose —
+and market.get_klines drops the still-forming last candle so analysis
+never repaints.
 """
 
 import os
@@ -28,7 +29,12 @@ def _trend_candles(n=120, bull=True):
 
 class _MTFMarket:
     def get_klines(self, symbol, interval, limit=None):
-        return _trend_candles(bull=True)  # 4h/1h legs: BULLISH
+        return _trend_candles(bull=True)  # 1h leg: BULLISH
+
+
+class _MTFMarketBear1h:
+    def get_klines(self, symbol, interval, limit=None):
+        return _trend_candles(bull=(interval != "1h"))  # 1h leg: BEARISH
 
 
 def _mtf_with(five_m_signal, a30_signal):
@@ -43,10 +49,9 @@ def _mtf_with(five_m_signal, a30_signal):
 
 
 def test_mtf_weighted_rejects_when_soft_legs_oppose():
-    """Regression for review T-1: hard gate 4h+1h aligned but 30m and 5m
-    neutral. Old scoring added the always-aligned 15m leg (0.55+0.15 =
-    0.70 = threshold) and could never reject. Excluding 15m and
-    renormalising gives 0.55/0.85 = 0.65 < 0.70 -> must FAIL."""
+    """MTF set 1h/30m/15m/5m: hard 1h aligned (0.40) and the 15m signal
+    leg always aligned (0.20), but 30m and 5m both neutral -> score
+    0.60 < 0.70 -> must FAIL (the gate can still reject)."""
     ok, note = _mtf_with("NEUTRAL", "NEUTRAL")
     assert ok is False, note
     assert "MTF score" in note
@@ -58,12 +63,28 @@ def test_mtf_weighted_passes_when_all_aligned():
 
 
 def test_mtf_weighted_partial_soft_support():
-    # 30m aligned, 5m neutral: (0.30+0.25+0.20)/0.85 = 0.88 -> pass
+    # 30m aligned, 5m neutral: 0.40+0.25+0.20 = 0.85 -> pass
     ok, note = _mtf_with("NEUTRAL", "BULLISH WATCH")
     assert ok is True, note
-    # 30m neutral, 5m aligned: (0.30+0.25+0.10)/0.85 = 0.76 -> pass
+    # 30m neutral, 5m aligned: 0.40+0.20+0.15 = 0.75 -> pass
     ok, note = _mtf_with("BULLISH WATCH", "NEUTRAL")
     assert ok is True, note
+
+
+def test_mtf_hard_gate_rejects_when_1h_opposes():
+    # 1h BEARISH against a BULLISH signal: hard gate fails even though
+    # 30m/15m/5m are all aligned.
+    orig = signal_engine.analyze_candles
+    signal_engine.analyze_candles = (
+        lambda sym, iv, candles: {"signal": "BULLISH WATCH"})
+    try:
+        ok, note = mtf_check(_MTFMarketBear1h(), "TESTUSDT", "BULLISH",
+                             {"signal": "BULLISH WATCH"},
+                             {"signal": "BULLISH WATCH"})
+    finally:
+        signal_engine.analyze_candles = orig
+    assert ok is False, note
+    assert "hard-gate" in note
 
 
 def test_klines_drop_unclosed_last_candle():
@@ -93,5 +114,6 @@ if __name__ == "__main__":
     test_mtf_weighted_rejects_when_soft_legs_oppose()
     test_mtf_weighted_passes_when_all_aligned()
     test_mtf_weighted_partial_soft_support()
+    test_mtf_hard_gate_rejects_when_1h_opposes()
     test_klines_drop_unclosed_last_candle()
     print("engine fixes ok")

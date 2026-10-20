@@ -4,7 +4,7 @@ Pipeline per symbol:
   1. Liquidity (24h volume)
   2. 15m setup (EMA / RSI / MACD / volume) → BULLISH or BEARISH WATCH
   3. Noise filter (efficiency ratio, doji, flips, DI conflict)
-  4. MTF weighted (hard 4h+1h, soft lower TFs)
+  4. MTF weighted (hard 1h, score over 1h/30m/15m/5m)
   5. Optional BTC 15m alignment
   6. Freshness vs entry zone
   7. Quality score ≥ MIN_QUALITY
@@ -234,12 +234,10 @@ def mtf_check(market, symbol: str, direction: str,
     want = direction
     try:
         a5 = analyze_candles(symbol, "5m", market.get_klines(symbol, "5m"))
-        k4h = market.get_klines(symbol, "4h")
         k1h = market.get_klines(symbol, "1h")
     except Exception as e:  # noqa: BLE001
         return False, f"MTF data error: {e}"
     legs = {
-        "4h": mtf_trend([float(c["close"]) for c in k4h]),
         "1h": mtf_trend([float(c["close"]) for c in k1h]),
         "30m": _dir(a30.get("signal")),
         "15m": _dir(a15.get("signal")),
@@ -249,12 +247,13 @@ def mtf_check(market, symbol: str, direction: str,
     for tf in config.MTF_HARD:
         if legs.get(tf) != want:
             return False, f"MTF hard-gate fail ({detail}; need {want.lower()} on {'/'.join(config.MTF_HARD)})"
-    # Weighted score over the NON-signal timeframes only. The 15m leg is
-    # the signal's own timeframe — its direction always equals the signal
-    # direction, so including it made the score unable to ever reject
-    # (hard-gate 0.55 + free 0.15 = exactly the 0.70 threshold). Remaining
-    # weights are renormalised to a total of 1.0.
-    score_legs = {tf: d for tf, d in legs.items() if tf != "15m"}
+    # Weighted score over the MTF set 1h/30m/15m/5m (user config
+    # 2026-10-21; the 4h leg is gone). The 15m leg is the signal's own
+    # timeframe and is always aligned, but it cannot carry the gate on
+    # its own: hard 1h (0.40) + 15m (0.20) = 0.60 < 0.70, so at least
+    # one of 30m/5m must also align for a signal to pass. Weights are
+    # renormalised defensively in case the config table changes.
+    score_legs = legs
     total_w = sum(config.MTF_WEIGHTS.get(tf, 0) for tf in score_legs) or 1.0
     score = sum(config.MTF_WEIGHTS.get(tf, 0) / total_w
                 for tf, d in score_legs.items() if d == want)

@@ -9,7 +9,7 @@ Dirancang ulang dari nol — fokus engine sinyal bidirectional, bukan port penuh
 - **LONG dan SHORT** (default `BULLISH_ONLY=False`)
 - Setup 15m: EMA 9/21/50, RSI, MACD, volume
 - **Noise filter**: Efficiency Ratio, doji, direction flips, DI conflict, overextension
-- **MTF weighted**: hard gate 4h + 1h, skor soft 30m/5m (leg 15m = TF sinyal sendiri, tidak ikut diskor)
+- **MTF weighted**: hard gate 1h, skor weighted 1h/30m/15m/5m ≥ 0.70
 - **BTC align** opsional (15m)
 - Freshness vs entry zone
 - Quality score ≥ `MIN_QUALITY`
@@ -63,7 +63,7 @@ python main.py positions
 volume 24h
   → 15m BULLISH/BEARISH WATCH (strength ≥ 3)
   → noise filter
-  → MTF (4h+1h hard, weighted score ≥ 0.70 dari leg 4h/1h/30m/5m)
+  → MTF (1h hard, weighted score ≥ 0.70 dari leg 1h/30m/15m/5m)
   → BTC 15m align (opsional)
   → freshness live price
   → quality ≥ MIN_QUALITY
