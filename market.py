@@ -35,13 +35,14 @@ class BinanceFutures:
     # ------------------------------------------------------------------ HTTP
     def _get(self, path: str, params: dict | None = None, signed: bool = False) -> Any:
         params = dict(params or {})
-        if signed:
-            params = self._sign(params)
         url = self.base + path
         last_err = None
         for attempt in range(config.HTTP_RETRIES):
+            # re-sign per attempt: a signed timestamp goes stale across
+            # retry sleeps (recvWindow), so reuse can fail with -1021
+            attempt_params = self._sign(params) if signed else params
             try:
-                r = self.session.get(url, params=params, timeout=config.HTTP_TIMEOUT)
+                r = self.session.get(url, params=attempt_params, timeout=config.HTTP_TIMEOUT)
                 if r.status_code == 429:
                     last_err = RuntimeError("429 rate limited")
                     time.sleep(1.5 * (attempt + 1))

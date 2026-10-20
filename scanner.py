@@ -83,10 +83,36 @@ class SignalStore:
         self.conn.execute("UPDATE signals SET status=? WHERE id=?", (status, signal_id))
         self.conn.commit()
 
+    def claim(self, signal_id: str) -> bool:
+        """Atomically flip a fresh signal to 'claimed'.
+
+        Returns True only for the caller that won the flip, so two
+        executor processes can never open the same signal twice
+        (closes the check-then-place TOCTOU window). Expired signals
+        cannot be claimed.
+        """
+        now = int(time.time() * 1000)
+        cur = self.conn.execute(
+            "UPDATE signals SET status='claimed' "
+            "WHERE id=? AND status='fresh' AND expires_at > ?",
+            (signal_id, now),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def release_claim(self, signal_id: str) -> None:
+        """Give a claimed signal back (executor aborted before ordering)."""
+        self.conn.execute(
+            "UPDATE signals SET status='fresh' WHERE id=? AND status='claimed'",
+            (signal_id,),
+        )
+        self.conn.commit()
+
     def expire_old(self) -> int:
         now = int(time.time() * 1000)
         cur = self.conn.execute(
-            "UPDATE signals SET status='expired' WHERE status='fresh' AND expires_at <= ?",
+            "UPDATE signals SET status='expired' "
+            "WHERE status IN ('fresh', 'claimed') AND expires_at <= ?",
             (now,),
         )
         self.conn.commit()

@@ -187,7 +187,14 @@ def test_unfilled_limit_pending_then_reconcile_attaches():
         assert rec is None
         assert _types(mkt) == ["LIMIT"], "no SL/TP before fill"
         assert "TESTUSDT" in ex.state.get("pending", {})
-        assert len(store.fresh()) == 1, "signal not consumed while pending"
+        # atomic claim: while its entry is pending the signal is held as
+        # 'claimed' — not fresh, not opened (not consumable by anyone else)
+        st = store.conn.execute(
+            "SELECT status FROM signals WHERE id=?",
+            (sig["_sid"],)).fetchone()
+        assert st is not None and st[0] == "claimed", \
+            f"signal held as claimed while pending, got {st}"
+        assert store.fresh() == [], "claimed signal not visible as fresh"
         # later: the LIMIT fills (position appears, order reports FILLED)
         mkt.order_status = "FILLED"
         mkt._positions = [{"symbol": "TESTUSDT", "amount": 5.0,

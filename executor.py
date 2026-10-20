@@ -310,6 +310,11 @@ class Executor:
         if status in ("CANCELED", "EXPIRED", "REJECTED"):
             log.info("reconcile %s: entry order %s — freeing symbol",
                      symbol, status)
+            try:
+                if prec.get("_sid"):
+                    self.store.release_claim(prec["_sid"])
+            except Exception:  # noqa: BLE001
+                pass
             return None
         age_ms = int(time.time() * 1000) - int(prec.get("placed_at") or 0)
         if order is None and pos is None:
@@ -318,6 +323,11 @@ class Executor:
             if age_ms > 60_000:
                 log.warning("reconcile %s: order vanished without fill — "
                             "freeing symbol", symbol)
+                try:
+                    if prec.get("_sid"):
+                        self.store.release_claim(prec["_sid"])
+                except Exception:  # noqa: BLE001
+                    pass
                 return None
             return _STILL_PENDING
         if eq > 0:
@@ -336,6 +346,11 @@ class Executor:
                          "cancelled", symbol, config.ORDER_TTL_SEC)
             except Exception as e:  # noqa: BLE001
                 log.warning("reconcile %s TTL cancel failed: %s", symbol, e)
+            try:
+                if prec.get("_sid"):
+                    self.store.release_claim(prec["_sid"])
+            except Exception:  # noqa: BLE001
+                pass
             return None
         return _STILL_PENDING
 
@@ -353,7 +368,35 @@ class Executor:
             log.info("skip %s: signal age %.0fs > TTL", symbol, age_s)
             return None
 
+        # --- atomic claim: only one process may work this signal ---
+        sid = signal.get("_sid")
+        claimed = False
+        if sid:
+            try:
+                claimed = bool(self.store.claim(sid))
+            except Exception as e:  # noqa: BLE001
+                # claim() may have partially applied: release defensively
+                # so no signal leaks in 'claimed' state without a release.
+                log.error("abort %s: claim(%s) raised %s", symbol, sid, e)
+                try:
+                    self.store.release_claim(sid)
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            if not claimed:
+                log.info("skip %s: signal %s already claimed by another "
+                         "process", symbol, sid)
+                return None
+
+        def _release_claim():
+            if claimed:
+                try:
+                    self.store.release_claim(sid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("release claim %s: %s", sid, e)
+
         if self._kill_active():
+            _release_claim()
             log.warning("skip %s: kill switch active (%s)", symbol,
                         os.path.join(config.DATA_DIR, config.KILL_FILE_NAME))
             return None
@@ -361,10 +404,12 @@ class Executor:
         # one position per symbol
         open_pos = self.market.positions()
         if any(p["symbol"] == symbol for p in open_pos):
+            _release_claim()
             log.info("skip %s: already in position", symbol)
             return None
         # a LIMIT entry of ours is still waiting for its fill
         if symbol in (self.state.get("pending") or {}):
+            _release_claim()
             log.info("skip %s: pending entry awaiting fill", symbol)
             return None
         # guard: pending entry order from an earlier attempt (LIMIT may sit unfilled)
@@ -374,19 +419,23 @@ class Executor:
         except Exception:  # noqa: BLE001
             pending_orders = []
         if pending_orders:
+            _release_claim()
             log.info("skip %s: %d pending entry order(s)", symbol,
                      len(pending_orders))
             return None
         if len(open_pos) >= config.MAX_OPEN_POSITIONS:
+            _release_claim()
             log.info("skip %s: max open positions %d", symbol,
                      config.MAX_OPEN_POSITIONS)
             return None
 
         equity = self.market.balance_usdt()
         if equity <= 0:
+            _release_claim()
             log.warning("no USDT balance")
             return None
         if self._daily_blocked(equity):
+            _release_claim()
             log.warning("skip %s: daily loss cap reached", symbol)
             return None
 
@@ -395,6 +444,7 @@ class Executor:
         tp1 = float(signal["tp1"])
         qty = self.position_qty(symbol, entry, stop, equity)
         if qty <= 0:
+            _release_claim()
             log.info("skip %s: qty=0 (risk too small)", symbol)
             return None
 
@@ -406,6 +456,7 @@ class Executor:
         min_notional = max(config.MIN_NOTIONAL_USDT,
                            float(filt.get("minNotional") or 0))
         if qty * entry < min_notional:
+            _release_claim()
             log.info("skip %s: notional %.2f < min %.2f",
                      symbol, qty * entry, min_notional)
             return None
@@ -416,6 +467,7 @@ class Executor:
             self.market.set_margin_type(symbol, config.MARGIN_MODE)
             self.market.set_leverage(symbol, config.MAX_LEVERAGE)
         except Exception as e:  # noqa: BLE001
+            _release_claim()
             log.error("abort %s: margin/leverage setup failed: %s", symbol, e)
             return None
 
@@ -435,6 +487,7 @@ class Executor:
                     symbol, side, qty, order_type="MARKET",
                     client_id=client_id)
         except Exception as e:  # noqa: BLE001
+            _release_claim()
             log.error("entry failed %s: %s", symbol, e)
             return None
 
@@ -456,6 +509,7 @@ class Executor:
             symbol, client_id, order, qty,
             is_limit=(config.ORDER_TYPE == "LIMIT"))
         if fill_state == "dead":
+            _release_claim()
             log.error("entry %s did not fill (order %s)", symbol,
                       str(order.get("status") or "dead"))
             return None
@@ -470,6 +524,7 @@ class Executor:
 
         rec = self._complete_open(prec, fill_qty, order=order)
         if rec is None:
+            _release_claim()
             log.error("open %s aborted: SL failed — position "
                       "emergency-closed", symbol)
             return None
