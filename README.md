@@ -62,9 +62,10 @@ python main.py positions
 ```
 volume 24h
   → 15m BULLISH/BEARISH WATCH (strength ≥ 3)
+  → regime brake (RANGING = no-trade zone, REGIME_BLOCK_RANGING)
   → noise filter
-  → MTF (1h hard, weighted score ≥ 0.70 dari leg 1h/30m/15m/5m)
-  → BTC 15m align (opsional)
+  → MTF (1h hard, weighted score ≥ 0.70 dari leg tren EMA 1h/30m/15m/5m)
+  → BTC align (opsional: vote 15m + tren 1h tidak boleh melawan)
   → freshness live price
   → quality ≥ MIN_QUALITY
   → SIGNAL LONG atau SHORT
