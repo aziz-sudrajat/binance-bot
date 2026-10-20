@@ -3,6 +3,63 @@
 from __future__ import annotations
 
 import os
+import sys
+
+
+def _load_dotenv(path: str | None = None) -> dict:
+    """Minimal stdlib .env loader.
+
+    Reads KEY=VALUE lines from the .env file next to this module and sets
+    them in os.environ WITHOUT overriding variables already present (a
+    real exported environment always wins over the file). Returns the
+    parsed pairs. A missing file is not an error.
+    """
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    pairs: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return pairs
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if not key:
+            continue
+        pairs[key] = val
+        os.environ.setdefault(key, val)
+    return pairs
+
+
+_load_dotenv()
+
+_VALID_MODES = ("paper", "testnet", "live")
+
+
+def _normalize_mode(raw: str) -> str:
+    """Fail-closed TRADE_MODE: unknown values fall back to paper."""
+    mode = str(raw or "").strip().lower()
+    if mode in _VALID_MODES:
+        return mode
+    print(f"config: unknown TRADE_MODE {raw!r} - falling back to 'paper'",
+          file=sys.stderr)
+    return "paper"
+
+
+def _normalize_choice(raw: str, valid: tuple, default: str) -> str:
+    """Fail-closed enum knob: unknown values fall back to the default."""
+    val = str(raw or "").strip().upper()
+    if val in valid:
+        return val
+    print(f"config: unknown value {raw!r} (expected {'/'.join(valid)})"
+          f" - using {default}", file=sys.stderr)
+    return default
+
 
 # ---------------------------------------------------------------------------
 # Mode
@@ -10,7 +67,7 @@ import os
 # paper  = signals only (no orders)
 # testnet = Binance Futures testnet orders
 # live   = real USDT-M futures (requires keys + LIVE_CONFIRM=YES)
-TRADE_MODE = os.environ.get("TRADE_MODE", "testnet").strip().lower()
+TRADE_MODE = _normalize_mode(os.environ.get("TRADE_MODE", "testnet"))
 
 # ---------------------------------------------------------------------------
 # Binance endpoints
@@ -44,7 +101,7 @@ KLINES_LIMIT = 200
 MTF_HARD = ("4h", "1h")
 MTF_WEIGHTS = {"4h": 0.30, "1h": 0.25, "30m": 0.20, "15m": 0.15, "5m": 0.10}
 MTF_MIN_SCORE = 0.70
-BTC_ALIGN = os.environ.get("BTC_ALIGN", "1") not in ("0", "false", "False")
+BTC_ALIGN = os.environ.get("BTC_ALIGN", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Noise filters
 NOISE_ER_MIN = 0.18
@@ -73,11 +130,15 @@ TP3_RR = 3.00
 RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))  # % of equity per trade
 MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "5"))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
-# Margin mode: ISOLATED (default, crew standard — loss is contained per
-# position) or CROSSED. MARGIN_TYPE kept as a backwards-compatible alias.
-MARGIN_MODE = os.environ.get("MARGIN_MODE", "ISOLATED").strip().upper()
+# Margin mode knob: default ISOLATED (crew standard — loss is contained
+# per position). MARGIN_MODE is the primary name; the older MARGIN_TYPE
+# env is honoured as a fallback, and MARGIN_TYPE stays as an alias.
+MARGIN_MODE = _normalize_choice(
+    os.environ.get("MARGIN_MODE", os.environ.get("MARGIN_TYPE", "ISOLATED")),
+    ("ISOLATED", "CROSSED"), "ISOLATED")
 MARGIN_TYPE = MARGIN_MODE
-ORDER_TYPE = "LIMIT"  # LIMIT entry near signal entry; fallback MARKET
+ORDER_TYPE = _normalize_choice(os.environ.get("ORDER_TYPE", "LIMIT"),
+                               ("LIMIT", "MARKET"), "LIMIT")  # LIMIT entry near signal entry; MARKET = immediate
 SIGNAL_TTL_SEC = 1800  # ignore signals older than 30 min
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "900"))  # 15 min
 HTTP_TIMEOUT = 15

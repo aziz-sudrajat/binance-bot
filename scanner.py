@@ -26,6 +26,9 @@ class SignalStore:
         self.path = path or config.SIGNALS_DB
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        # multi-process safety: scanner and trader may hold the DB at once
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute(
             """CREATE TABLE IF NOT EXISTS signals (
                 id TEXT PRIMARY KEY,
@@ -44,6 +47,13 @@ class SignalStore:
         ttl = ttl_sec or config.SIGNAL_TTL_SEC
         now = int(time.time() * 1000)
         sid = f"{signal['symbol']}:{signal['direction']}:{signal.get('timestamp', now)}"
+        # a newer plan for the same symbol+direction supersedes older
+        # still-fresh rows, so the executor never works a stale duplicate
+        self.conn.execute(
+            "UPDATE signals SET status='superseded' "
+            "WHERE symbol=? AND direction=? AND status='fresh' AND id != ?",
+            (signal["symbol"], signal["direction"], sid),
+        )
         self.conn.execute(
             """INSERT OR REPLACE INTO signals
                (id, symbol, direction, quality, payload, created_at, expires_at, status)
