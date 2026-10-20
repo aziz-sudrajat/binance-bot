@@ -1,4 +1,18 @@
-"""Auto-trader — place LONG/SHORT entries + SL/TP on Binance Futures."""
+"""Auto-trader — place LONG/SHORT entries + SL/TP on Binance Futures.
+
+Safety model:
+- SL/TP are attached ONLY after the entry order has actually filled
+  (MARKET: fill verified; LIMIT: polled up to ORDER_FILL_WAIT_SEC, then
+  the entry is tracked as "pending" in state and reconciled on later
+  passes — fills get their SL/TP then, stale entries are cancelled
+  after ORDER_TTL_SEC).
+- If the SL cannot be placed after a fill (retries exhausted), the
+  position is emergency-closed with a reduce-only MARKET order and the
+  signal is NOT marked opened. A naked position is never left behind
+  silently.
+- Margin/leverage setup failures abort the entry.
+- A KILL file in DATA_DIR and the daily loss cap block new entries.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +28,8 @@ from market import BinanceFutures
 from scanner import SignalStore, ensure_data_dir
 
 log = logging.getLogger("executor")
+
+_STILL_PENDING = object()  # reconcile sentinel: entry still working
 
 
 def _round_step(value: float, step: float) -> float:
@@ -48,6 +64,13 @@ class Executor:
         with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2)
 
+    def close(self) -> None:
+        """Release the signal-store DB connection."""
+        try:
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def can_trade(self) -> tuple[bool, str]:
         mode = config.TRADE_MODE
         if mode == "paper":
@@ -58,6 +81,40 @@ class Executor:
             return False, "missing BINANCE_API_KEY / BINANCE_API_SECRET"
         return True, "ok"
 
+    # ------------------------------------------------------------ guards
+    def _kill_active(self) -> bool:
+        return os.path.exists(os.path.join(config.DATA_DIR,
+                                           config.KILL_FILE_NAME))
+
+    def _daily_blocked(self, equity: float) -> bool:
+        """Block entries once today's equity drops past the loss cap.
+
+        The first equity seen each day becomes the day's baseline and is
+        persisted in executor state."""
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        daily = self.state.get("daily")
+        if not isinstance(daily, dict) or daily.get("date") != today:
+            self.state["daily"] = {"date": today,
+                                   "start_equity": float(equity)}
+            self._save_state()
+            return False
+        start = float(daily.get("start_equity") or 0)
+        if start > 0 and equity < start * (1 - config.DAILY_LOSS_CAP_PCT / 100.0):
+            log.warning("daily loss cap: equity %.2f vs day start %.2f "
+                        "(cap %.1f%%)", equity, start, config.DAILY_LOSS_CAP_PCT)
+            return True
+        return False
+
+    def _position_for(self, symbol: str) -> dict | None:
+        try:
+            for p in self.market.positions():
+                if p.get("symbol") == symbol and abs(float(p.get("amount") or 0)) > 0:
+                    return p
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    # -------------------------------------------------------------- sizing
     def position_qty(self, symbol: str, entry: float, stop: float,
                      equity: float) -> float:
         """Risk-based size: risk_pct of equity / |entry-stop|."""
@@ -74,6 +131,215 @@ class Executor:
             return 0.0
         return qty
 
+    # --------------------------------------------------------- fill handling
+    def _await_fill(self, symbol: str, client_id: str, order: dict,
+                    want_qty: float, is_limit: bool) -> tuple[str, float]:
+        """Resolve an entry order's fill state.
+
+        Returns ("filled", qty) | ("pending", 0) | ("dead", 0). "pending"
+        is only returned for LIMIT orders still working after the wait
+        window; the caller records them for later reconciliation."""
+        status = str(order.get("status") or "").upper()
+        eq = float(order.get("executedQty") or 0)
+        if status == "FILLED":
+            return "filled", eq if eq > 0 else want_qty
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            return "dead", 0.0
+        if not hasattr(self.market, "get_order"):
+            # Duck-typed markets (unit-test fakes) cannot be polled: fall
+            # back to position presence, else assume the venue filled.
+            pos = self._position_for(symbol)
+            if pos is not None:
+                return "filled", abs(float(pos.get("amount") or want_qty))
+            return "filled", want_qty
+        deadline = time.time() + max(0.0, float(config.ORDER_FILL_WAIT_SEC))
+        last_eq = eq
+        while True:
+            try:
+                o = self.market.get_order(symbol, client_id=client_id)
+            except Exception:  # noqa: BLE001
+                o = None
+            if isinstance(o, dict):
+                st = str(o.get("status") or "").upper()
+                last_eq = float(o.get("executedQty") or 0)
+                if st == "FILLED":
+                    return "filled", last_eq if last_eq > 0 else want_qty
+                if st in ("CANCELED", "EXPIRED", "REJECTED"):
+                    return "dead", 0.0
+            if time.time() >= deadline:
+                break
+            time.sleep(max(0.05, float(config.ORDER_FILL_POLL_SEC)))
+        pos = self._position_for(symbol)
+        if pos is not None:
+            return "filled", abs(float(pos.get("amount") or want_qty))
+        if last_eq > 0:
+            # partial fill: cancel the remainder, protect what filled
+            try:
+                self.market.cancel_all(symbol)
+            except Exception as e:  # noqa: BLE001
+                log.warning("cancel partial %s: %s", symbol, e)
+            return "filled", last_eq
+        return ("pending", 0.0) if is_limit else ("dead", 0.0)
+
+    def _attach_protection(self, symbol: str, close_side: str, qty: float,
+                           stop: float, tp1: float, client_id: str) -> bool:
+        """Place SL (retried) + TP1 for a filled position.
+
+        If the SL cannot be placed, the position is emergency-closed
+        with a reduce-only MARKET order. Returns True only when the SL
+        is in place."""
+        sl_ok = False
+        attempts = max(1, int(config.SL_ATTACH_RETRIES))
+        for attempt in range(1, attempts + 1):
+            try:
+                self.market.place_order(
+                    symbol, close_side, qty, order_type="STOP_MARKET",
+                    stop_price=stop, reduce_only=True,
+                    client_id=(client_id + "sl")[:36])
+                sl_ok = True
+                break
+            except Exception as e:  # noqa: BLE001
+                log.warning("SL attach %s attempt %d/%d failed: %s",
+                            symbol, attempt, attempts, e)
+                if attempt < attempts:
+                    time.sleep(max(0.0, float(config.SL_RETRY_DELAY_SEC)))
+        if not sl_ok:
+            log.error("SL FAILED %s after %d attempts — EMERGENCY CLOSE",
+                      symbol, attempts)
+            try:
+                self.market.place_order(
+                    symbol, close_side, qty, order_type="MARKET",
+                    reduce_only=True, client_id=(client_id + "ec")[:36])
+                log.error("emergency close %s submitted", symbol)
+            except Exception as e:  # noqa: BLE001
+                log.critical("EMERGENCY CLOSE FAILED %s: %s — POSITION "
+                             "NAKED, ACT MANUALLY", symbol, e)
+            return False
+        try:
+            self.market.place_order(
+                symbol, close_side, qty, order_type="TAKE_PROFIT_MARKET",
+                stop_price=tp1, reduce_only=True,
+                client_id=(client_id + "tp")[:36])
+        except Exception as e:  # noqa: BLE001
+            log.warning("TP failed %s: %s", symbol, e)
+        return True
+
+    def _complete_open(self, prec: dict, qty: float,
+                       order: dict | None = None) -> dict | None:
+        """Attach SL/TP to a filled entry and record it as opened.
+
+        Returns the record, or None when protection failed (the position
+        has been emergency-closed; the signal is NOT marked opened)."""
+        symbol = prec["symbol"]
+        close_side = "SELL" if prec["direction"] == "LONG" else "BUY"
+        if not self._attach_protection(symbol, close_side, qty,
+                                       float(prec["stop"]),
+                                       float(prec["tp1"]),
+                                       prec["client_id"]):
+            return None
+        rec = {
+            "symbol": symbol,
+            "direction": prec["direction"],
+            "qty": qty,
+            "entry": prec["entry"],
+            "stop": prec["stop"],
+            "tp1": prec["tp1"],
+            "order": order if order is not None else prec.get("order"),
+            "at": int(time.time() * 1000),
+            "quality": prec.get("quality"),
+        }
+        self.state.setdefault("opened", {})[symbol] = rec
+        self.state.setdefault("history", []).append(rec)
+        # mark signal consumed so the next trade/loop run doesn't re-open it
+        sid = prec.get("_sid")
+        if sid:
+            try:
+                self.store.mark(sid, "opened")
+            except Exception as e:  # noqa: BLE001
+                log.warning("mark opened %s: %s", sid, e)
+        return rec
+
+    # --------------------------------------------------------- reconciliation
+    def reconcile_pending(self) -> list[dict]:
+        """Resolve pending LIMIT entries recorded in state.
+
+        Filled since placement -> attach SL/TP now. Gone without a fill
+        -> free the symbol. Still working past ORDER_TTL_SEC -> cancel.
+        Runs on the normal trade/loop path before fresh signals."""
+        ok, _why = self.can_trade()
+        if not ok:
+            return []
+        pending = self.state.get("pending") or {}
+        if not pending:
+            return []
+        opened: list[dict] = []
+        changed = False
+        for symbol, prec in list(pending.items()):
+            try:
+                rec = self._reconcile_one(symbol, prec)
+            except Exception as e:  # noqa: BLE001
+                log.warning("reconcile %s failed: %s", symbol, e)
+                continue
+            if rec is _STILL_PENDING:
+                continue
+            pending.pop(symbol, None)
+            changed = True
+            if isinstance(rec, dict):
+                opened.append(rec)
+        if changed:
+            self._save_state()
+        return opened
+
+    def _reconcile_one(self, symbol: str, prec: dict):
+        client_id = prec.get("client_id")
+        order = None
+        if client_id and hasattr(self.market, "get_order"):
+            try:
+                order = self.market.get_order(symbol, client_id=client_id)
+            except Exception:  # noqa: BLE001
+                order = None
+        pos = self._position_for(symbol)
+        status = str((order or {}).get("status") or "").upper()
+        eq = float((order or {}).get("executedQty") or 0)
+        if pos is not None or status == "FILLED":
+            qty = (abs(float(pos.get("amount"))) if pos is not None
+                   else (eq if eq > 0 else float(prec["qty"])))
+            log.info("reconcile %s: entry filled qty=%s — attaching SL/TP",
+                     symbol, qty)
+            return self._complete_open(prec, qty)
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            log.info("reconcile %s: entry order %s — freeing symbol",
+                     symbol, status)
+            return None
+        age_ms = int(time.time() * 1000) - int(prec.get("placed_at") or 0)
+        if order is None and pos is None:
+            # Order unknown and no position: only free the symbol after a
+            # grace period (the venue may just be lagging).
+            if age_ms > 60_000:
+                log.warning("reconcile %s: order vanished without fill — "
+                            "freeing symbol", symbol)
+                return None
+            return _STILL_PENDING
+        if eq > 0:
+            # partial fill: cancel the remainder, protect what filled
+            try:
+                self.market.cancel_all(symbol)
+            except Exception as e:  # noqa: BLE001
+                log.warning("reconcile %s cancel partial: %s", symbol, e)
+            log.info("reconcile %s: partial fill qty=%s — attaching SL/TP",
+                     symbol, eq)
+            return self._complete_open(prec, eq)
+        if age_ms > config.ORDER_TTL_SEC * 1000:
+            try:
+                self.market.cancel_all(symbol)
+                log.info("reconcile %s: pending entry past TTL %ds — "
+                         "cancelled", symbol, config.ORDER_TTL_SEC)
+            except Exception as e:  # noqa: BLE001
+                log.warning("reconcile %s TTL cancel failed: %s", symbol, e)
+            return None
+        return _STILL_PENDING
+
+    # -------------------------------------------------------------- entries
     def open_from_signal(self, signal: dict) -> dict | None:
         ok, why = self.can_trade()
         if not ok:
@@ -87,27 +353,41 @@ class Executor:
             log.info("skip %s: signal age %.0fs > TTL", symbol, age_s)
             return None
 
+        if self._kill_active():
+            log.warning("skip %s: kill switch active (%s)", symbol,
+                        os.path.join(config.DATA_DIR, config.KILL_FILE_NAME))
+            return None
+
         # one position per symbol
         open_pos = self.market.positions()
         if any(p["symbol"] == symbol for p in open_pos):
             log.info("skip %s: already in position", symbol)
             return None
+        # a LIMIT entry of ours is still waiting for its fill
+        if symbol in (self.state.get("pending") or {}):
+            log.info("skip %s: pending entry awaiting fill", symbol)
+            return None
         # guard: pending entry order from an earlier attempt (LIMIT may sit unfilled)
         try:
-            pending = [o for o in self.market.open_orders(symbol)
-                       if str(o.get("clientOrderId", "")).startswith("bb")]
+            pending_orders = [o for o in self.market.open_orders(symbol)
+                              if str(o.get("clientOrderId", "")).startswith("bb")]
         except Exception:  # noqa: BLE001
-            pending = []
-        if pending:
-            log.info("skip %s: %d pending entry order(s)", symbol, len(pending))
+            pending_orders = []
+        if pending_orders:
+            log.info("skip %s: %d pending entry order(s)", symbol,
+                     len(pending_orders))
             return None
         if len(open_pos) >= config.MAX_OPEN_POSITIONS:
-            log.info("skip %s: max open positions %d", symbol, config.MAX_OPEN_POSITIONS)
+            log.info("skip %s: max open positions %d", symbol,
+                     config.MAX_OPEN_POSITIONS)
             return None
 
         equity = self.market.balance_usdt()
         if equity <= 0:
             log.warning("no USDT balance")
+            return None
+        if self._daily_blocked(equity):
+            log.warning("skip %s: daily loss cap reached", symbol)
             return None
 
         entry = float(signal["entry"])
@@ -123,11 +403,23 @@ class Executor:
         stop = _round_tick(stop, filt["tickSize"])
         tp1 = _round_tick(tp1, filt["tickSize"])
 
-        self.market.set_margin_type(symbol, config.MARGIN_TYPE)
-        self.market.set_leverage(symbol, config.MAX_LEVERAGE)
+        min_notional = max(config.MIN_NOTIONAL_USDT,
+                           float(filt.get("minNotional") or 0))
+        if qty * entry < min_notional:
+            log.info("skip %s: notional %.2f < min %.2f",
+                     symbol, qty * entry, min_notional)
+            return None
+
+        # margin/leverage setup is part of the trade's risk definition:
+        # if it cannot be applied, the entry must not happen at all.
+        try:
+            self.market.set_margin_type(symbol, config.MARGIN_MODE)
+            self.market.set_leverage(symbol, config.MAX_LEVERAGE)
+        except Exception as e:  # noqa: BLE001
+            log.error("abort %s: margin/leverage setup failed: %s", symbol, e)
+            return None
 
         side = "BUY" if direction == "LONG" else "SELL"
-        close_side = "SELL" if direction == "LONG" else "BUY"
         client_id = f"bb{int(time.time())}{symbol[:6]}"[:36]
 
         log.info("OPEN %s %s qty=%s entry~%s stop=%s tp1=%s",
@@ -146,44 +438,42 @@ class Executor:
             log.error("entry failed %s: %s", symbol, e)
             return None
 
-        # protective SL + TP (reduce-only)
-        try:
-            self.market.place_order(
-                symbol, close_side, qty, order_type="STOP_MARKET",
-                stop_price=stop, reduce_only=True,
-                client_id=(client_id + "sl")[:36])
-        except Exception as e:  # noqa: BLE001
-            log.error("SL failed %s: %s — manual risk!", symbol, e)
-
-        try:
-            self.market.place_order(
-                symbol, close_side, qty, order_type="TAKE_PROFIT_MARKET",
-                stop_price=tp1, reduce_only=True,
-                client_id=(client_id + "tp")[:36])
-        except Exception as e:  # noqa: BLE001
-            log.warning("TP failed %s: %s", symbol, e)
-
-        rec = {
+        prec = {
             "symbol": symbol,
             "direction": direction,
             "qty": qty,
             "entry": entry,
             "stop": stop,
             "tp1": tp1,
+            "client_id": client_id,
             "order": order,
-            "at": int(time.time() * 1000),
             "quality": signal.get("quality"),
+            "_sid": signal.get("_sid"),
+            "placed_at": int(time.time() * 1000),
         }
-        self.state.setdefault("opened", {})[symbol] = rec
-        self.state.setdefault("history", []).append(rec)
+
+        fill_state, fill_qty = self._await_fill(
+            symbol, client_id, order, qty,
+            is_limit=(config.ORDER_TYPE == "LIMIT"))
+        if fill_state == "dead":
+            log.error("entry %s did not fill (order %s)", symbol,
+                      str(order.get("status") or "dead"))
+            return None
+        if fill_state == "pending":
+            # LIMIT still working: track it; reconciliation attaches
+            # SL/TP when it fills, or cancels it after ORDER_TTL_SEC.
+            self.state.setdefault("pending", {})[symbol] = prec
+            self._save_state()
+            log.info("pending %s: LIMIT entry unfilled — tracked for "
+                     "reconciliation", symbol)
+            return None
+
+        rec = self._complete_open(prec, fill_qty, order=order)
+        if rec is None:
+            log.error("open %s aborted: SL failed — position "
+                      "emergency-closed", symbol)
+            return None
         self._save_state()
-        # mark signal consumed so the next trade/loop run doesn't re-open it
-        sid = signal.get("_sid")
-        if sid:
-            try:
-                self.store.mark(sid, "opened")
-            except Exception as e:  # noqa: BLE001
-                log.warning("mark opened %s: %s", sid, e)
         return rec
 
     def process_fresh_signals(self) -> list[dict]:
@@ -191,7 +481,7 @@ class Executor:
         if not ok:
             log.info("executor idle: %s", why)
             return []
-        results = []
+        results = list(self.reconcile_pending())
         for sig in self.store.fresh(limit=10):
             rec = self.open_from_signal(sig)
             if rec:

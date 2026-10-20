@@ -54,9 +54,49 @@ def test_long_short_plans():
         assert p["tp1"] < p["entry"] < p["stop_loss"]
 
 
+def _flat_candles(n=120, p=100.0):
+    out = []
+    for _ in range(n):
+        out.append({"open": p, "high": p * 1.0005, "low": p * 0.9995,
+                    "close": p, "volume": 1000})
+    return out
+
+
+def _volatile_candles(n=120):
+    import random
+    rnd = random.Random(42)
+    out, p = [], 100.0
+    for _ in range(n):
+        chg = rnd.uniform(-0.02, 0.02)
+        o = p
+        p = p * (1 + chg)
+        out.append({"open": o, "high": max(o, p) * 1.002,
+                    "low": min(o, p) * 0.998, "close": p,
+                    "volume": 500 + rnd.uniform(0, 2000)})
+    return out
+
+
+def test_trade_plan_invariants():
+    """Entry/stop/TP ordering must hold for every market shape."""
+    for cs in (_trend_candles(bull=True), _trend_candles(bull=False),
+               _flat_candles(), _volatile_candles()):
+        a = analyze_candles("X", "15m", cs)
+        plan = a["trade_plan"]
+        if a["signal"] == "BULLISH WATCH":
+            assert plan["stop_loss"] < plan["entry"] < plan["tp1"], plan
+            assert plan["tp1"] < plan["tp2"] < plan["tp3"], plan
+        elif a["signal"] == "BEARISH WATCH":
+            assert plan["tp1"] < plan["entry"] < plan["stop_loss"], plan
+            assert plan["tp3"] < plan["tp2"] < plan["tp1"], plan
+        if plan:
+            assert plan["risk"] > 0
+            assert plan["entry_low"] <= plan["entry"] <= plan["entry_high"]
+
+
 if __name__ == "__main__":
     test_analyze_bull()
     test_analyze_bear_plan()
     test_noise_and_quality()
     test_long_short_plans()
+    test_trade_plan_invariants()
     print("smoke ok")

@@ -103,7 +103,22 @@ def test_pending_entry_order_blocks_reopen():
     store.close()
 
 
+def test_executor_close_releases_store():
+    import sqlite3
+    store = SignalStore()
+    mkt = FakeMarket()
+    ex = _executor(store, mkt)
+    ex.close()
+    try:
+        store.fresh()
+    except sqlite3.ProgrammingError:
+        pass  # expected: connection closed
+    else:
+        raise AssertionError("store connection should be closed")
+
+
 if __name__ == "__main__":
     test_signal_marked_opened_and_not_reopened()
     test_pending_entry_order_blocks_reopen()
+    test_executor_close_releases_store()
     print("executor smoke ok")

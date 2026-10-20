@@ -249,9 +249,15 @@ def mtf_check(market, symbol: str, direction: str,
     for tf in config.MTF_HARD:
         if legs.get(tf) != want:
             return False, f"MTF hard-gate fail ({detail}; need {want.lower()} on {'/'.join(config.MTF_HARD)})"
-    total_w = sum(config.MTF_WEIGHTS.get(tf, 0) for tf in legs) or 1.0
+    # Weighted score over the NON-signal timeframes only. The 15m leg is
+    # the signal's own timeframe — its direction always equals the signal
+    # direction, so including it made the score unable to ever reject
+    # (hard-gate 0.55 + free 0.15 = exactly the 0.70 threshold). Remaining
+    # weights are renormalised to a total of 1.0.
+    score_legs = {tf: d for tf, d in legs.items() if tf != "15m"}
+    total_w = sum(config.MTF_WEIGHTS.get(tf, 0) for tf in score_legs) or 1.0
     score = sum(config.MTF_WEIGHTS.get(tf, 0) / total_w
-                for tf, d in legs.items() if d == want)
+                for tf, d in score_legs.items() if d == want)
     if score < config.MTF_MIN_SCORE:
         return False, f"MTF score {score:.2f} < {config.MTF_MIN_SCORE} ({detail})"
     return True, f"MTF ok score {score:.2f} ({detail})"

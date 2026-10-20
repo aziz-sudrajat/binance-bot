@@ -9,7 +9,7 @@ Dirancang ulang dari nol — fokus engine sinyal bidirectional, bukan port penuh
 - **LONG dan SHORT** (default `BULLISH_ONLY=False`)
 - Setup 15m: EMA 9/21/50, RSI, MACD, volume
 - **Noise filter**: Efficiency Ratio, doji, direction flips, DI conflict, overextension
-- **MTF weighted**: hard gate 4h + 1h, skor soft 30m/15m/5m
+- **MTF weighted**: hard gate 4h + 1h, skor soft 30m/5m (leg 15m = TF sinyal sendiri, tidak ikut diskor)
 - **BTC align** opsional (15m)
 - Freshness vs entry zone
 - Quality score ≥ `MIN_QUALITY`
@@ -63,7 +63,7 @@ python main.py positions
 volume 24h
   → 15m BULLISH/BEARISH WATCH (strength ≥ 3)
   → noise filter
-  → MTF (4h+1h hard, weighted score ≥ 0.70)
+  → MTF (4h+1h hard, weighted score ≥ 0.70 dari leg 4h/1h/30m/5m)
   → BTC 15m align (opsional)
   → freshness live price
   → quality ≥ MIN_QUALITY
@@ -75,7 +75,16 @@ volume 24h
 - Default **testnet**. Live hanya jika `TRADE_MODE=live` **dan** `LIVE_CONFIRM=YES`.
 - Size = `RISK_PCT%` equity / jarak entry−stop.
 - Max posisi terbuka: `MAX_OPEN_POSITIONS`.
-- SL/TP di-exchange; jika SL gagal, bot log warning — pantau manual.
+- Margin default **ISOLATED** (`MARGIN_MODE`). Gagal set margin/leverage = entry dibatalkan.
+- SL/TP dipasang **setelah entry terisi** (LIMIT ditunggu/dipoll; belum terisi → dicatat
+  sebagai pending dan direkonsiliasi di pass berikutnya; pending lewat `ORDER_TTL_SEC`
+  dibatalkan). Jika SL gagal dipasang setelah fill (3x retry), posisi **ditutup darurat**
+  via market reduce-only — tidak ada posisi telanjang yang dibiarkan.
+- **Kill switch**: buat file `KILL` di folder `data/` → semua entry baru terblokir.
+- **Batas rugi harian**: entry terblokir bila equity turun > `DAILY_LOSS_CAP_PCT%`
+  dari equity awal hari (dicatat di `executor_state.json`).
+- Entry diskip bila notional (qty × harga) di bawah MIN_NOTIONAL exchange /
+  `MIN_NOTIONAL_USDT`.
 
 ## File data
 
@@ -96,6 +105,10 @@ data/bot.log
 | `BTC_ALIGN` | 1 | arah BTC harus sama |
 | `RISK_PCT` | 1.0 | % equity per trade |
 | `MAX_LEVERAGE` | 5 | leverage |
+| `MARGIN_MODE` | ISOLATED | ISOLATED / CROSSED |
+| `MIN_NOTIONAL_USDT` | 5 | notional minimum per entry |
+| `DAILY_LOSS_CAP_PCT` | 10 | blokir entry bila equity harian turun melewati % ini |
+| `ORDER_TTL_SEC` | 1800 | umur maks order LIMIT pending sebelum dibatalkan |
 | `UNIVERSE` | top | top volume atau list |
 
 ## Disclaimer

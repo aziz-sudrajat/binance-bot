@@ -43,6 +43,7 @@ class BinanceFutures:
             try:
                 r = self.session.get(url, params=params, timeout=config.HTTP_TIMEOUT)
                 if r.status_code == 429:
+                    last_err = RuntimeError("429 rate limited")
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 r.raise_for_status()
@@ -102,22 +103,26 @@ class BinanceFutures:
         return sorted(out)
 
     def symbol_filters(self, symbol: str) -> dict:
-        """Return tickSize, stepSize, minQty for symbol."""
+        """Return tickSize, stepSize, minQty, minNotional for symbol."""
         info = self.exchange_info()
         for s in info.get("symbols", []):
             if s.get("symbol") == symbol:
-                tick = step = min_qty = None
+                tick = step = min_qty = min_notional = None
                 for f in s.get("filters", []):
                     if f.get("filterType") == "PRICE_FILTER":
                         tick = float(f["tickSize"])
                     elif f.get("filterType") == "LOT_SIZE":
                         step = float(f["stepSize"])
                         min_qty = float(f["minQty"])
+                    elif f.get("filterType") == "MIN_NOTIONAL":
+                        min_notional = float(f["notional"])
                 return {"tickSize": tick or 0.01, "stepSize": step or 0.001,
                         "minQty": min_qty or 0.001,
+                        "minNotional": min_notional,
                         "pricePrecision": s.get("pricePrecision", 4),
                         "quantityPrecision": s.get("quantityPrecision", 3)}
         return {"tickSize": 0.01, "stepSize": 0.001, "minQty": 0.001,
+                "minNotional": None,
                 "pricePrecision": 4, "quantityPrecision": 3}
 
     def get_klines(self, symbol: str, interval: str,
@@ -138,6 +143,12 @@ class BinanceFutures:
                 "close_time": int(row[6]),
                 "quote_volume": float(row[7]),
             })
+        # Drop the still-forming last candle: every consumer of klines is
+        # signal analysis, and evaluating an unclosed candle repaints
+        # (signals appear/disappear intra-candle, volume ratio skewed).
+        now_ms = int(time.time() * 1000)
+        if out and out[-1]["close_time"] >= now_ms:
+            out.pop()
         return out
 
     def get_ticker_price(self, symbol: str) -> float:
@@ -197,22 +208,22 @@ class BinanceFutures:
         return open_pos
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
-        try:
-            self._post("/fapi/v1/leverage", {
-                "symbol": symbol, "leverage": int(leverage),
-            })
-        except Exception as e:  # noqa: BLE001
-            log.warning("set_leverage %s: %s", symbol, e)
+        """Set leverage. Raises on failure — the caller must abort the
+        entry rather than trade on a stale account leverage."""
+        self._post("/fapi/v1/leverage", {
+            "symbol": symbol, "leverage": int(leverage),
+        })
 
-    def set_margin_type(self, symbol: str, margin_type: str = "CROSSED") -> None:
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> None:
+        """Set margin type. Raises on failure (caller aborts the entry),
+        except Binance -4046 ("already set"), which is benign."""
         try:
             self._post("/fapi/v1/marginType", {
                 "symbol": symbol, "marginType": margin_type,
             })
         except Exception as e:  # noqa: BLE001
-            # -4046 already set
             if "4046" not in str(e):
-                log.debug("set_margin_type %s: %s", symbol, e)
+                raise
 
     def open_orders(self, symbol: str) -> list[dict]:
         """Open orders for a symbol (used to avoid duplicate entries)."""
@@ -250,6 +261,17 @@ class BinanceFutures:
             params["stopPrice"] = stop_price
             params["workingType"] = working_type
         return self._post("/fapi/v1/order", params)
+
+    def get_order(self, symbol: str, client_id: str | None = None,
+                  order_id: int | None = None) -> dict:
+        """Query one order by clientOrderId or orderId. Raises when the
+        order does not exist (Binance -2013) or the request fails."""
+        params: dict[str, Any] = {"symbol": symbol}
+        if client_id:
+            params["origClientOrderId"] = client_id
+        if order_id:
+            params["orderId"] = order_id
+        return self._get("/fapi/v1/order", params, signed=True)
 
     def cancel_all(self, symbol: str) -> Any:
         return self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})

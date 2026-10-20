@@ -50,7 +50,10 @@ def cmd_scan(_args) -> int:
 
 def cmd_trade(_args) -> int:
     ex = Executor()
-    recs = ex.process_fresh_signals()
+    try:
+        recs = ex.process_fresh_signals()
+    finally:
+        ex.close()
     print(json.dumps(recs, indent=2, default=str))
     return 0
 
@@ -58,7 +61,10 @@ def cmd_trade(_args) -> int:
 def cmd_run(_args) -> int:
     run_scan()
     ex = Executor()
-    recs = ex.process_fresh_signals()
+    try:
+        recs = ex.process_fresh_signals()
+    finally:
+        ex.close()
     print(f"opened {len(recs)} trades")
     return 0
 
@@ -67,16 +73,20 @@ def cmd_loop(args) -> int:
     interval = args.interval or config.SCAN_INTERVAL_SEC
     log = logging.getLogger("main")
     log.info("loop every %ss mode=%s", interval, config.TRADE_MODE)
-    while True:
-        try:
-            run_scan()
-            Executor().process_fresh_signals()
-        except KeyboardInterrupt:
-            log.info("stopped")
-            return 0
-        except Exception as e:  # noqa: BLE001
-            log.exception("loop error: %s", e)
-        time.sleep(interval)
+    ex = Executor()
+    try:
+        while True:
+            try:
+                run_scan()
+                ex.process_fresh_signals()
+            except KeyboardInterrupt:
+                log.info("stopped")
+                return 0
+            except Exception as e:  # noqa: BLE001
+                log.exception("loop error: %s", e)
+            time.sleep(interval)
+    finally:
+        ex.close()
 
 
 def cmd_signals(_args) -> int:
