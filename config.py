@@ -102,6 +102,10 @@ MTF_HARD = ("1h",)
 MTF_WEIGHTS = {"1h": 0.40, "30m": 0.25, "15m": 0.20, "5m": 0.15}
 MTF_MIN_SCORE = 0.70
 BTC_ALIGN = os.environ.get("BTC_ALIGN", "1").strip().lower() not in ("0", "false", "no", "off")
+# Hard regime brake: a RANGING symbol (ADX < 18) is a no-trade zone for
+# this trend-following engine (audit 2026-10-21: BTC itself was approved
+# LONG at Q=95 while RANGING, and the whole book bled in chop).
+REGIME_BLOCK_RANGING = os.environ.get("REGIME_BLOCK_RANGING", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Noise filters
 NOISE_ER_MIN = 0.18
@@ -109,8 +113,9 @@ NOISE_DOJI_MAX = 0.60
 NOISE_FLIPS_MAX = 3
 NOISE_DI_ADX_MIN = 22
 
-# Setup / overextension
-OVEREXTENSION_ATR_MAX = 3.0
+# Setup / overextension (tightened 3.0 -> 2.0 in the 2026-10-21 audit:
+# entries were filling 2-3 ATR above EMA21 at local tops)
+OVEREXTENSION_ATR_MAX = 2.0
 FRESHNESS_MAX_DRIFT_PCT = 0.6
 
 # Trade plan (ATR multiples)

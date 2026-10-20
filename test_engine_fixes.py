@@ -1,7 +1,8 @@
-"""Engine fix tests (bug-hunt round 2) — no network.
+"""Engine fix tests (bug-hunt round 2 + signal audit 2026-10-21) — no network.
 
-Covers: MTF set 1h/30m/15m/5m (user config 2026-10-21) — hard gate on
-1h, weighted score that can still reject when both soft legs oppose —
+Covers: MTF set 1h/30m/15m/5m with trend-based legs (hard gate on 1h,
+weighted score that rejects in chop), the RANGING regime brake, BTC 1h
+context in btc_align, the discriminative quality scale,
 market.get_klines drops the still-forming last candle so analysis
 never repaints, and market.equity_usdt returns margin balance (not
 available balance) for the daily loss cap.
@@ -14,7 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import signal_engine
-from signal_engine import mtf_check
+from signal_engine import btc_align, evaluate_symbol, mtf_check, quality_score
 
 
 def _trend_candles(n=120, bull=True):
@@ -28,64 +29,143 @@ def _trend_candles(n=120, bull=True):
     return out
 
 
+def _flat_candles(n=120, price=100.0):
+    return [{"open": price, "high": price, "low": price,
+             "close": price, "volume": 1000} for _ in range(n)]
+
+
 class _MTFMarket:
+    """Per-interval trend control: 'bull' | 'bear' | 'flat' (NEUTRAL)."""
+
+    def __init__(self, trends=None):
+        self.trends = trends or {}
+
     def get_klines(self, symbol, interval, limit=None):
-        return _trend_candles(bull=True)  # 1h leg: BULLISH
+        t = self.trends.get(interval, "bull")
+        if t == "flat":
+            return _flat_candles()
+        return _trend_candles(bull=(t == "bull"))
 
 
-class _MTFMarketBear1h:
-    def get_klines(self, symbol, interval, limit=None):
-        return _trend_candles(bull=(interval != "1h"))  # 1h leg: BEARISH
+def _mtf(trends=None):
+    return mtf_check(_MTFMarket(trends), "TESTUSDT", "BULLISH",
+                     {"signal": "BULLISH WATCH"})
 
 
-def _mtf_with(five_m_signal, a30_signal):
-    orig = signal_engine.analyze_candles
-    signal_engine.analyze_candles = (
-        lambda sym, iv, candles: {"signal": five_m_signal})
-    try:
-        return mtf_check(_MTFMarket(), "TESTUSDT", "BULLISH",
-                         {"signal": "BULLISH WATCH"}, {"signal": a30_signal})
-    finally:
-        signal_engine.analyze_candles = orig
-
-
-def test_mtf_weighted_rejects_when_soft_legs_oppose():
-    """MTF set 1h/30m/15m/5m: hard 1h aligned (0.40) and the 15m signal
-    leg always aligned (0.20), but 30m and 5m both neutral -> score
-    0.60 < 0.70 -> must FAIL (the gate can still reject)."""
-    ok, note = _mtf_with("NEUTRAL", "NEUTRAL")
+def test_mtf_trend_legs_reject_in_chop():
+    """Audit regression 2026-10-21: with voting legs the MTF gate
+    rejected 0 of ~160 live evaluations. Trend legs: 1h trend aligned
+    (0.40) + 15m signal leg (0.20), but 30m and 5m trends NEUTRAL
+    (flat) -> score 0.60 < 0.70 -> must FAIL."""
+    ok, note, score = _mtf({"30m": "flat", "5m": "flat"})
     assert ok is False, note
-    assert "MTF score" in note
+    assert "MTF score" in note and abs(score - 0.60) < 1e-9
 
 
-def test_mtf_weighted_passes_when_all_aligned():
-    ok, note = _mtf_with("BULLISH WATCH", "BULLISH WATCH")
+def test_mtf_trend_legs_pass_when_all_aligned():
+    ok, note, score = _mtf({})
     assert ok is True, note
+    assert abs(score - 1.0) < 1e-9
 
 
-def test_mtf_weighted_partial_soft_support():
-    # 30m aligned, 5m neutral: 0.40+0.25+0.20 = 0.85 -> pass
-    ok, note = _mtf_with("NEUTRAL", "BULLISH WATCH")
-    assert ok is True, note
-    # 30m neutral, 5m aligned: 0.40+0.20+0.15 = 0.75 -> pass
-    ok, note = _mtf_with("BULLISH WATCH", "NEUTRAL")
-    assert ok is True, note
+def test_mtf_trend_legs_partial_support():
+    # 30m trend aligned, 5m flat: 0.40+0.25+0.20 = 0.85 -> pass
+    ok, note, score = _mtf({"5m": "flat"})
+    assert ok is True and abs(score - 0.85) < 1e-9, note
+    # 30m flat, 5m trend aligned: 0.40+0.20+0.15 = 0.75 -> pass
+    ok, note, score = _mtf({"30m": "flat"})
+    assert ok is True and abs(score - 0.75) < 1e-9, note
 
 
 def test_mtf_hard_gate_rejects_when_1h_opposes():
-    # 1h BEARISH against a BULLISH signal: hard gate fails even though
-    # 30m/15m/5m are all aligned.
-    orig = signal_engine.analyze_candles
-    signal_engine.analyze_candles = (
-        lambda sym, iv, candles: {"signal": "BULLISH WATCH"})
-    try:
-        ok, note = mtf_check(_MTFMarketBear1h(), "TESTUSDT", "BULLISH",
-                             {"signal": "BULLISH WATCH"},
-                             {"signal": "BULLISH WATCH"})
-    finally:
-        signal_engine.analyze_candles = orig
+    # 1h trend BEARISH against a BULLISH signal: hard gate fails even
+    # though 30m/15m/5m are all aligned.
+    ok, note, score = _mtf({"1h": "bear"})
     assert ok is False, note
     assert "hard-gate" in note
+
+
+def test_quality_score_discriminates():
+    """Audit regression: the old scale put strength 5 at base 90 so
+    MIN_QUALITY=62 never bit. The rebuilt scale must spread: a perfect
+    setup scores high, a weak one lands BELOW the quality gate."""
+    strong = {"strength": 5, "regime": "TRENDING BULLISH",
+              "volume_ratio": 1.4, "efficiency_ratio": 0.4,
+              "plus_di": 30.0, "minus_di": 10.0}
+    assert quality_score(strong, "BULLISH", 1.0) >= 90
+    weak = {"strength": 3, "regime": "MIXED", "volume_ratio": 1.0,
+            "efficiency_ratio": 0.1, "plus_di": 10.0, "minus_di": 30.0}
+    assert quality_score(weak, "BULLISH", 0.75) < 62
+    # regime swing (+8 trending vs -12 ranging = 20) measured at
+    # strength 4 so neither side hits the 98 clamp
+    s4 = dict(strong, strength=4)
+    ranging4 = dict(s4, regime="RANGING")
+    assert quality_score(s4, "BULLISH", 1.0) - \
+        quality_score(ranging4, "BULLISH", 1.0) >= 20
+
+
+class _EvalMarket:
+    def get_24h_quote_volume(self, symbol):
+        return 50_000_000.0
+
+    def get_klines(self, symbol, interval, limit=None):
+        return _trend_candles(bull=True)
+
+    def get_ticker_price(self, symbol):
+        return 100.0
+
+
+def _prepared_a15(regime):
+    plan = {"entry": 100.0, "entry_low": 99.9, "entry_high": 100.1,
+            "stop_loss": 98.0, "tp1": 103.0, "tp2": 104.5, "tp3": 106.0,
+            "rr1": 1.5, "risk": 2.0, "atr": 1.0}
+    return {"signal": "BULLISH WATCH", "strength": 4, "regime": regime,
+            "trade_plan": plan, "rsi": 55.0, "adx": 25.0,
+            "volume_ratio": 1.2, "efficiency_ratio": 0.3,
+            "plus_di": 25.0, "minus_di": 15.0, "price": 100.0,
+            "ema21": 99.0, "atr": 1.0, "reasons": ["test"],
+            "doji_ratio": 0.1, "direction_flips": 0}
+
+
+def test_regime_brake_blocks_ranging():
+    orig = signal_engine.analyze_candles
+    signal_engine.analyze_candles = (
+        lambda sym, iv, candles: _prepared_a15("RANGING"))
+    try:
+        sig, reason = evaluate_symbol("TESTUSDT", _EvalMarket())
+    finally:
+        signal_engine.analyze_candles = orig
+    assert sig is None and "regime" in reason, reason
+
+
+def test_full_path_passes_when_trending():
+    orig = signal_engine.analyze_candles
+    signal_engine.analyze_candles = (
+        lambda sym, iv, candles: _prepared_a15("TRENDING BULLISH"))
+    try:
+        sig, note = evaluate_symbol("TESTUSDT", _EvalMarket())
+    finally:
+        signal_engine.analyze_candles = orig
+    assert sig is not None, note
+    assert sig["quality"] >= 62
+
+
+class _BTCMarket:
+    def __init__(self, h1_bull):
+        self.h1_bull = h1_bull
+
+    def get_klines(self, symbol, interval, limit=None):
+        if interval == "1h":
+            return _trend_candles(bull=self.h1_bull)
+        return _trend_candles(bull=True)
+
+
+def test_btc_align_blocks_opposing_1h_trend():
+    # BTC 15m vote is bullish but its 1h trend is BEARISH -> block.
+    ok, note = btc_align(_BTCMarket(h1_bull=False), "BULLISH")
+    assert ok is False and "opposes" in note, note
+    ok, note = btc_align(_BTCMarket(h1_bull=True), "BULLISH")
+    assert ok is True, note
 
 
 def test_klines_drop_unclosed_last_candle():
@@ -186,10 +266,14 @@ def test_equity_usdt_fallback_wallet_plus_upnl():
 
 
 if __name__ == "__main__":
-    test_mtf_weighted_rejects_when_soft_legs_oppose()
-    test_mtf_weighted_passes_when_all_aligned()
-    test_mtf_weighted_partial_soft_support()
+    test_mtf_trend_legs_reject_in_chop()
+    test_mtf_trend_legs_pass_when_all_aligned()
+    test_mtf_trend_legs_partial_support()
     test_mtf_hard_gate_rejects_when_1h_opposes()
+    test_quality_score_discriminates()
+    test_regime_brake_blocks_ranging()
+    test_full_path_passes_when_trending()
+    test_btc_align_blocks_opposing_1h_trend()
     test_klines_drop_unclosed_last_candle()
     test_conditional_orders_route_to_algo_api()
     test_equity_usdt_uses_margin_balance_not_available()

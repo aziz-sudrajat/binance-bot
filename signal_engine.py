@@ -3,11 +3,12 @@
 Pipeline per symbol:
   1. Liquidity (24h volume)
   2. 15m setup (EMA / RSI / MACD / volume) → BULLISH or BEARISH WATCH
-  3. Noise filter (efficiency ratio, doji, flips, DI conflict)
-  4. MTF weighted (hard 1h, score over 1h/30m/15m/5m)
-  5. Optional BTC 15m alignment
-  6. Freshness vs entry zone
-  7. Quality score ≥ MIN_QUALITY
+  3. Regime brake (RANGING = no-trade zone)
+  4. Noise filter (efficiency ratio, doji, flips, DI conflict)
+  5. MTF weighted (hard 1h, trend-based legs 1h/30m/15m/5m)
+  6. Optional BTC alignment (15m direction + 1h trend context)
+  7. Freshness vs entry zone
+  8. Quality score ≥ MIN_QUALITY
 """
 
 from __future__ import annotations
@@ -220,46 +221,51 @@ def noise_ok(a15: dict, direction: str) -> tuple[bool, str]:
     dist = (float(a15["price"]) - float(a15["ema21"])) / atr
     if direction == "BULLISH" and dist > config.OVEREXTENSION_ATR_MAX:
         rsi = float(a15.get("rsi") or 50)
-        if rsi >= 68:
+        if rsi >= 65:
             return False, f"noise: overextended +{dist:.1f}ATR RSI{rsi:.0f}"
     if direction == "BEARISH" and dist < -config.OVEREXTENSION_ATR_MAX:
         rsi = float(a15.get("rsi") or 50)
-        if rsi <= 32:
+        if rsi <= 35:
             return False, f"noise: overextended {dist:.1f}ATR RSI{rsi:.0f}"
     return True, "noise clean"
 
 
 def mtf_check(market, symbol: str, direction: str,
-              a15: dict, a30: dict) -> tuple[bool, str]:
+              a15: dict) -> tuple[bool, str, float]:
+    """MTF gate over the user's set 1h/30m/15m/5m. Returns
+    (ok, note, weighted_score).
+
+    Legs 1h/30m/5m are EMA-trend based (mtf_trend), NOT the setup
+    voting used for the 15m trigger: the voting legs were perfectly
+    correlated with the trigger itself, so the gate rejected nothing
+    (0 rejects in ~160 evaluations, live testnet audit 2026-10-21).
+    Trend legs measure whether the move is sustained on each TF.
+    The 15m leg is the signal itself and stays for reporting/scoring
+    as the user configured; it cannot carry the gate alone
+    (1h 0.40 + 15m 0.20 = 0.60 < 0.70)."""
     want = direction
     try:
-        a5 = analyze_candles(symbol, "5m", market.get_klines(symbol, "5m"))
         k1h = market.get_klines(symbol, "1h")
+        k30 = market.get_klines(symbol, "30m")
+        k5 = market.get_klines(symbol, "5m")
     except Exception as e:  # noqa: BLE001
-        return False, f"MTF data error: {e}"
+        return False, f"MTF data error: {e}", 0.0
     legs = {
         "1h": mtf_trend([float(c["close"]) for c in k1h]),
-        "30m": _dir(a30.get("signal")),
+        "30m": mtf_trend([float(c["close"]) for c in k30]),
         "15m": _dir(a15.get("signal")),
-        "5m": _dir(a5.get("signal")),
+        "5m": mtf_trend([float(c["close"]) for c in k5]),
     }
     detail = ", ".join(f"{tf}={d.lower()}" for tf, d in legs.items())
     for tf in config.MTF_HARD:
         if legs.get(tf) != want:
-            return False, f"MTF hard-gate fail ({detail}; need {want.lower()} on {'/'.join(config.MTF_HARD)})"
-    # Weighted score over the MTF set 1h/30m/15m/5m (user config
-    # 2026-10-21; the 4h leg is gone). The 15m leg is the signal's own
-    # timeframe and is always aligned, but it cannot carry the gate on
-    # its own: hard 1h (0.40) + 15m (0.20) = 0.60 < 0.70, so at least
-    # one of 30m/5m must also align for a signal to pass. Weights are
-    # renormalised defensively in case the config table changes.
-    score_legs = legs
-    total_w = sum(config.MTF_WEIGHTS.get(tf, 0) for tf in score_legs) or 1.0
+            return False, f"MTF hard-gate fail ({detail}; need {want.lower()} on {'/'.join(config.MTF_HARD)})", 0.0
+    total_w = sum(config.MTF_WEIGHTS.get(tf, 0) for tf in legs) or 1.0
     score = sum(config.MTF_WEIGHTS.get(tf, 0) / total_w
-                for tf, d in score_legs.items() if d == want)
+                for tf, d in legs.items() if d == want)
     if score < config.MTF_MIN_SCORE:
-        return False, f"MTF score {score:.2f} < {config.MTF_MIN_SCORE} ({detail})"
-    return True, f"MTF ok score {score:.2f} ({detail})"
+        return False, f"MTF score {score:.2f} < {config.MTF_MIN_SCORE} ({detail})", score
+    return True, f"MTF ok score {score:.2f} ({detail})", score
 
 
 def btc_align(market, direction: str) -> tuple[bool, str]:
@@ -270,11 +276,31 @@ def btc_align(market, direction: str) -> tuple[bool, str]:
     got = _dir(a.get("signal"))
     if got != direction:
         return False, f"BTC 15m {got.lower()} != signal {direction.lower()}"
-    return True, f"BTC aligned {direction.lower()}"
+    # Market context: BTC's 1h trend must not OPPOSE the trade. The old
+    # check only matched the 15m vote sign — the same stacked momentum
+    # vote as the trigger — so it waved through a full book of LONGs
+    # while BTC's higher timeframe was rolling over (audit 2026-10-21).
+    # NEUTRAL is allowed; only an opposing trend blocks.
+    try:
+        k1h = market.get_klines("BTCUSDT", "1h")
+        t1h = mtf_trend([float(c["close"]) for c in k1h])
+    except Exception as e:  # noqa: BLE001
+        return False, f"BTC data error: {e}"
+    if (direction == "BULLISH" and t1h == "BEARISH") or \
+            (direction == "BEARISH" and t1h == "BULLISH"):
+        return False, f"BTC 1h trend {t1h.lower()} opposes {direction.lower()}"
+    return True, f"BTC aligned {direction.lower()} (1h {t1h.lower()})"
 
 
-def quality_score(a15: dict, direction: str, mtf_note: str) -> int:
-    base = {3: 60, 4: 75, 5: 90}.get(int(a15.get("strength") or 0), 50)
+def quality_score(a15: dict, direction: str, mtf_score: float) -> int:
+    """Discriminative quality (rebuilt in the 2026-10-21 audit).
+
+    The old scale started strength 5 at base 90, so nearly every
+    approval landed at 84-98 and MIN_QUALITY=62 never rejected
+    anything. The new scale spreads 40-98: strength base is lower,
+    regime swings are real (+8 / -12), and the MTF weighted score
+    contributes up to 10 points instead of a flat +2 for passing."""
+    base = {3: 45, 4: 60, 5: 75}.get(int(a15.get("strength") or 0), 40)
     # regime
     regime = a15.get("regime") or ""
     if direction == "BULLISH" and regime == "TRENDING BULLISH":
@@ -282,9 +308,9 @@ def quality_score(a15: dict, direction: str, mtf_note: str) -> int:
     elif direction == "BEARISH" and regime == "TRENDING BEARISH":
         base += 8
     elif regime == "HIGH VOLATILITY":
-        base -= 6
+        base -= 10
     elif regime == "RANGING":
-        base -= 4
+        base -= 12
     # volume
     vol = float(a15.get("volume_ratio") or 1)
     if vol >= 1.3:
@@ -302,12 +328,12 @@ def quality_score(a15: dict, direction: str, mtf_note: str) -> int:
         base += 3
     if direction == "BEARISH" and float(a15.get("minus_di") or 0) > float(a15.get("plus_di") or 0):
         base += 3
-    if "score" in mtf_note:
-        try:
-            # small bonus already implied by pass
-            base += 2
-        except Exception:  # noqa: BLE001
-            pass
+    # MTF weighted score (0..1) contributes up to 10 points
+    try:
+        ms = max(0.0, min(1.0, float(mtf_score)))
+    except (TypeError, ValueError):
+        ms = 0.0
+    base += int(round(10 * ms))
     return max(5, min(98, int(round(base))))
 
 
@@ -361,21 +387,21 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     if a15["strength"] < config.MIN_STRENGTH:
         return None, f"strength {a15['strength']} < {config.MIN_STRENGTH}"
 
-    # 2 noise
+    # 2b regime brake: trend engine does not trade a ranging symbol
+    if config.REGIME_BLOCK_RANGING and a15.get("regime") == "RANGING":
+        return None, "regime: RANGING (ADX low, choppy) — no-trade zone"
+
+    # 3 noise
     ok, note = noise_ok(a15, direction)
     if not ok:
         return None, note
 
-    # 3 MTF
-    try:
-        a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
-    except Exception as e:  # noqa: BLE001
-        return None, f"30m error: {e}"
-    ok, mtf_note = mtf_check(market, symbol, direction, a15, a30)
+    # 4 MTF (legs fetched inside mtf_check)
+    ok, mtf_note, mtf_score = mtf_check(market, symbol, direction, a15)
     if not ok:
         return None, mtf_note
 
-    # 4 BTC
+    # 5 BTC
     if config.BTC_ALIGN and symbol != "BTCUSDT":
         ok, btc_note = btc_align(market, direction)
         if not ok:
@@ -383,13 +409,13 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     else:
         btc_note = "BTC n/a"
 
-    # 5 freshness
+    # 6 freshness
     live, frej = freshness_ok(market, symbol, direction, a15["trade_plan"])
     if frej:
         return None, frej
 
-    # 6 quality
-    q = quality_score(a15, direction, mtf_note)
+    # 7 quality
+    q = quality_score(a15, direction, mtf_score)
     if q < config.MIN_QUALITY:
         return None, f"quality {q} < {config.MIN_QUALITY}"
 

@@ -37,7 +37,7 @@ def test_noise_and_quality():
     a = analyze_candles("TESTUSDT", "15m", _trend_candles(bull=True))
     ok, note = noise_ok(a, "BULLISH")
     assert isinstance(ok, bool)
-    q = quality_score(a, "BULLISH", "MTF ok score 0.90")
+    q = quality_score(a, "BULLISH", 0.90)
     assert 5 <= q <= 98
 
 

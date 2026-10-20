@@ -132,8 +132,8 @@ def resolve_universe(market: BinanceFutures) -> list[str]:
 
 def classify_reason(reason: str) -> str:
     r = (reason or "").lower()
-    for key in ("volume", "15m", "noise", "mtf", "btc", "freshness", "quality",
-                "strength", "bullish-only", "setup"):
+    for key in ("volume", "15m", "regime", "noise", "mtf", "btc", "freshness",
+                "quality", "strength", "bullish-only", "setup"):
         if key in r:
             return key if key != "setup" else "setup_15m"
     return "other"
