@@ -1,0 +1,255 @@
+"""Binance USDT-M Futures market data + signed trading client."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import time
+from typing import Any
+from urllib.parse import urlencode
+
+import requests
+
+import config
+
+log = logging.getLogger("market")
+
+
+class BinanceFutures:
+    """Public klines/tickers + optional signed trade endpoints."""
+
+    def __init__(self, api_key: str | None = None, api_secret: str | None = None,
+                 testnet: bool | None = None):
+        if testnet is None:
+            testnet = config.TRADE_MODE != "live"
+        self.base = config.BINANCE_TESTNET_FAPI if testnet else config.BINANCE_FAPI
+        self.api_key = (api_key if api_key is not None else config.API_KEY) or ""
+        self.api_secret = (api_secret if api_secret is not None else config.API_SECRET) or ""
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "binance-bot/1.0"})
+        if self.api_key:
+            self.session.headers["X-MBX-APIKEY"] = self.api_key
+        self._exchange_info: dict | None = None
+
+    # ------------------------------------------------------------------ HTTP
+    def _get(self, path: str, params: dict | None = None, signed: bool = False) -> Any:
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+        url = self.base + path
+        last_err = None
+        for attempt in range(config.HTTP_RETRIES):
+            try:
+                r = self.session.get(url, params=params, timeout=config.HTTP_TIMEOUT)
+                if r.status_code == 429:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                time.sleep(0.4 * (attempt + 1))
+        raise RuntimeError(f"GET {path} failed: {last_err}")
+
+    def _post(self, path: str, params: dict | None = None, signed: bool = True) -> Any:
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+        url = self.base + path
+        r = self.session.post(url, params=params, timeout=config.HTTP_TIMEOUT)
+        if r.status_code >= 400:
+            raise RuntimeError(f"POST {path} {r.status_code}: {r.text[:300]}")
+        return r.json()
+
+    def _delete(self, path: str, params: dict | None = None, signed: bool = True) -> Any:
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+        url = self.base + path
+        r = self.session.delete(url, params=params, timeout=config.HTTP_TIMEOUT)
+        if r.status_code >= 400:
+            raise RuntimeError(f"DELETE {path} {r.status_code}: {r.text[:300]}")
+        return r.json()
+
+    def _sign(self, params: dict) -> dict:
+        if not self.api_secret:
+            raise RuntimeError("API secret required for signed requests")
+        params = dict(params)
+        params["timestamp"] = int(time.time() * 1000)
+        params.setdefault("recvWindow", 5000)
+        query = urlencode(params)
+        sig = hmac.new(self.api_secret.encode(), query.encode(),
+                       hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        return params
+
+    # ----------------------------------------------------------- public data
+    def exchange_info(self) -> dict:
+        if self._exchange_info is None:
+            self._exchange_info = self._get("/fapi/v1/exchangeInfo")
+        return self._exchange_info
+
+    def list_usdt_perps(self) -> list[str]:
+        info = self.exchange_info()
+        out = []
+        for s in info.get("symbols", []):
+            if (s.get("quoteAsset") == config.QUOTE
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"
+                    and s.get("symbol", "").endswith(config.QUOTE)):
+                out.append(s["symbol"])
+        return sorted(out)
+
+    def symbol_filters(self, symbol: str) -> dict:
+        """Return tickSize, stepSize, minQty for symbol."""
+        info = self.exchange_info()
+        for s in info.get("symbols", []):
+            if s.get("symbol") == symbol:
+                tick = step = min_qty = None
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        tick = float(f["tickSize"])
+                    elif f.get("filterType") == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        min_qty = float(f["minQty"])
+                return {"tickSize": tick or 0.01, "stepSize": step or 0.001,
+                        "minQty": min_qty or 0.001,
+                        "pricePrecision": s.get("pricePrecision", 4),
+                        "quantityPrecision": s.get("quantityPrecision", 3)}
+        return {"tickSize": 0.01, "stepSize": 0.001, "minQty": 0.001,
+                "pricePrecision": 4, "quantityPrecision": 3}
+
+    def get_klines(self, symbol: str, interval: str,
+                   limit: int | None = None) -> list[dict]:
+        limit = limit or config.KLINES_LIMIT
+        raw = self._get("/fapi/v1/klines", {
+            "symbol": symbol, "interval": interval, "limit": limit,
+        })
+        out = []
+        for row in raw:
+            out.append({
+                "open_time": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+                "close_time": int(row[6]),
+                "quote_volume": float(row[7]),
+            })
+        return out
+
+    def get_ticker_price(self, symbol: str) -> float:
+        data = self._get("/fapi/v1/ticker/price", {"symbol": symbol})
+        return float(data["price"])
+
+    def get_24h_tickers(self) -> list[dict]:
+        return self._get("/fapi/v1/ticker/24hr")
+
+    def top_symbols_by_volume(self, n: int | None = None) -> list[str]:
+        n = n or config.TOP_N
+        tickers = self.get_24h_tickers()
+        rows = []
+        for t in tickers:
+            sym = t.get("symbol") or ""
+            if not sym.endswith(config.QUOTE):
+                continue
+            try:
+                vol = float(t.get("quoteVolume") or 0)
+            except (TypeError, ValueError):
+                continue
+            if vol < config.MIN_24H_VOLUME_USD:
+                continue
+            rows.append((sym, vol))
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in rows[:n]]
+
+    def get_24h_quote_volume(self, symbol: str) -> float | None:
+        try:
+            data = self._get("/fapi/v1/ticker/24hr", {"symbol": symbol})
+            return float(data.get("quoteVolume") or 0)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # -------------------------------------------------------------- account
+    def balance_usdt(self) -> float:
+        data = self._get("/fapi/v2/balance", signed=True)
+        for row in data:
+            if row.get("asset") == "USDT":
+                return float(row.get("availableBalance") or row.get("balance") or 0)
+        return 0.0
+
+    def positions(self) -> list[dict]:
+        data = self._get("/fapi/v2/positionRisk", signed=True)
+        open_pos = []
+        for p in data:
+            amt = float(p.get("positionAmt") or 0)
+            if abs(amt) > 0:
+                open_pos.append({
+                    "symbol": p["symbol"],
+                    "amount": amt,
+                    "entry": float(p.get("entryPrice") or 0),
+                    "unrealized": float(p.get("unRealizedProfit") or 0),
+                    "leverage": int(float(p.get("leverage") or 1)),
+                    "side": "LONG" if amt > 0 else "SHORT",
+                })
+        return open_pos
+
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        try:
+            self._post("/fapi/v1/leverage", {
+                "symbol": symbol, "leverage": int(leverage),
+            })
+        except Exception as e:  # noqa: BLE001
+            log.warning("set_leverage %s: %s", symbol, e)
+
+    def set_margin_type(self, symbol: str, margin_type: str = "CROSSED") -> None:
+        try:
+            self._post("/fapi/v1/marginType", {
+                "symbol": symbol, "marginType": margin_type,
+            })
+        except Exception as e:  # noqa: BLE001
+            # -4046 already set
+            if "4046" not in str(e):
+                log.debug("set_margin_type %s: %s", symbol, e)
+
+    def open_orders(self, symbol: str) -> list[dict]:
+        """Open orders for a symbol (used to avoid duplicate entries)."""
+        try:
+            data = self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+            return data if isinstance(data, list) else []
+        except Exception as e:  # noqa: BLE001
+            log.warning("openOrders %s: %s", symbol, e)
+            return []
+
+    def place_order(self, symbol: str, side: str, quantity: float,
+                    order_type: str = "MARKET", price: float | None = None,
+                    reduce_only: bool = False,
+                    stop_price: float | None = None,
+                    working_type: str = "MARK_PRICE",
+                    client_id: str | None = None) -> dict:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,  # BUY / SELL
+            "type": order_type,
+            "quantity": quantity,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if client_id:
+            params["newClientOrderId"] = client_id[:36]
+        if order_type == "LIMIT":
+            if price is None:
+                raise ValueError("LIMIT requires price")
+            params["price"] = price
+            params["timeInForce"] = "GTC"
+        if order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            if stop_price is None:
+                raise ValueError(f"{order_type} requires stop_price")
+            params["stopPrice"] = stop_price
+            params["workingType"] = working_type
+        return self._post("/fapi/v1/order", params)
+
+    def cancel_all(self, symbol: str) -> Any:
+        return self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})

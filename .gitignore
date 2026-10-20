@@ -1,0 +1,8 @@
+# secrets & local state
+.env
+data/
+
+# python
+__pycache__/
+*.pyc
+.venv/

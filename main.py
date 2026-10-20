@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""binance-bot — simple LONG+SHORT signal scanner + auto-trader.
+
+Usage:
+  python main.py scan              # one scan pass
+  python main.py trade             # open trades from fresh signals
+  python main.py run               # scan + trade once
+  python main.py loop              # continuous scan+trade
+  python main.py signals           # show fresh signals
+  python main.py positions         # show open positions
+  python main.py balance           # show USDT balance
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+
+import config
+from executor import Executor
+from market import BinanceFutures
+from scanner import SignalStore, ensure_data_dir, run_scan
+
+
+def setup_logging() -> None:
+    ensure_data_dir()
+    level = logging.INFO
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        handlers.append(logging.FileHandler(config.LOG_FILE))
+    except OSError:
+        pass
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+
+def cmd_scan(_args) -> int:
+    stats = run_scan()
+    print(json.dumps({k: v for k, v in stats.items() if k != "signals"}, indent=2))
+    if stats.get("signals"):
+        print("\nApproved:")
+        for s in stats["signals"]:
+            print(f"  {s['direction']:5} {s['symbol']:12} Q={s['quality']} entry={s['entry']}")
+    return 0
+
+
+def cmd_trade(_args) -> int:
+    ex = Executor()
+    recs = ex.process_fresh_signals()
+    print(json.dumps(recs, indent=2, default=str))
+    return 0
+
+
+def cmd_run(_args) -> int:
+    run_scan()
+    ex = Executor()
+    recs = ex.process_fresh_signals()
+    print(f"opened {len(recs)} trades")
+    return 0
+
+
+def cmd_loop(args) -> int:
+    interval = args.interval or config.SCAN_INTERVAL_SEC
+    log = logging.getLogger("main")
+    log.info("loop every %ss mode=%s", interval, config.TRADE_MODE)
+    while True:
+        try:
+            run_scan()
+            Executor().process_fresh_signals()
+        except KeyboardInterrupt:
+            log.info("stopped")
+            return 0
+        except Exception as e:  # noqa: BLE001
+            log.exception("loop error: %s", e)
+        time.sleep(interval)
+
+
+def cmd_signals(_args) -> int:
+    store = SignalStore()
+    try:
+        rows = store.fresh(30)
+    finally:
+        store.close()
+    if not rows:
+        print("no fresh signals")
+        return 0
+    for s in rows:
+        print(f"{s['direction']:5} {s['symbol']:12} Q={s['quality']:3} "
+              f"entry={s['entry']:.6g} stop={s['stop_loss']:.6g} "
+              f"tp1={s['tp1']:.6g} regime={s.get('regime')}")
+    return 0
+
+
+def cmd_positions(_args) -> int:
+    m = BinanceFutures()
+    if not m.api_key:
+        print("set BINANCE_API_KEY to query positions")
+        return 1
+    for p in m.positions():
+        print(f"{p['side']:5} {p['symbol']:12} amt={p['amount']} "
+              f"entry={p['entry']} uPnL={p['unrealized']}")
+    return 0
+
+
+def cmd_balance(_args) -> int:
+    m = BinanceFutures()
+    if not m.api_key:
+        print("set BINANCE_API_KEY")
+        return 1
+    print(f"USDT available: {m.balance_usdt():.4f}")
+    print(f"mode={config.TRADE_MODE} testnet={config.TRADE_MODE != 'live'}")
+    return 0
+
+
+def main() -> int:
+    setup_logging()
+    p = argparse.ArgumentParser(description="binance-bot LONG+SHORT futures")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("scan", help="run one signal scan")
+    sub.add_parser("trade", help="auto-trade fresh signals")
+    sub.add_parser("run", help="scan then trade once")
+    lp = sub.add_parser("loop", help="continuous scan+trade")
+    lp.add_argument("--interval", type=int, default=None)
+    sub.add_parser("signals", help="list fresh signals")
+    sub.add_parser("positions", help="list open positions")
+    sub.add_parser("balance", help="show USDT balance")
+
+    args = p.parse_args()
+    cmds = {
+        "scan": cmd_scan,
+        "trade": cmd_trade,
+        "run": cmd_run,
+        "loop": cmd_loop,
+        "signals": cmd_signals,
+        "positions": cmd_positions,
+        "balance": cmd_balance,
+    }
+    return cmds[args.cmd](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
