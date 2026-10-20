@@ -261,6 +261,19 @@ class BinanceFutures:
             log.warning("openOrders %s: %s", symbol, e)
             return []
 
+    def open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+        """Open conditional (algo) orders — where SL/TP live since the
+        Algo Order API migration. Used to verify protection is in place."""
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        try:
+            data = self._get("/fapi/v1/openAlgoOrders", params, signed=True)
+            return data if isinstance(data, list) else []
+        except Exception as e:  # noqa: BLE001
+            log.warning("openAlgoOrders %s: %s", symbol, e)
+            return []
+
     def place_order(self, symbol: str, side: str, quantity: float,
                     order_type: str = "MARKET", price: float | None = None,
                     reduce_only: bool = False,
@@ -273,6 +286,32 @@ class BinanceFutures:
             "type": order_type,
             "quantity": quantity,
         }
+        if order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP",
+                          "TAKE_PROFIT", "TRAILING_STOP_MARKET"):
+            # Binance migrated conditional orders to the Algo Order API
+            # (effective 2025-12-09): /fapi/v1/order rejects them with
+            # -4120 "use the Algo Order API endpoints instead" (hit live
+            # on testnet 2026-10-21 — every SL attach failed and the
+            # executor emergency-closed each position). Route via
+            # /fapi/v1/algoOrder: stopPrice -> triggerPrice,
+            # newClientOrderId -> newClientAlgoId.
+            if stop_price is None:
+                raise ValueError(f"{order_type} requires stop_price")
+            algo_params: dict[str, Any] = {
+                "algoType": "CONDITIONAL",
+                "symbol": symbol,
+                "side": side,
+                "type": order_type,
+                "quantity": quantity,
+                "triggerPrice": stop_price,
+                "workingType": working_type,
+                "timeInForce": "GTE_GTC",
+            }
+            if reduce_only:
+                algo_params["reduceOnly"] = "true"
+            if client_id:
+                algo_params["newClientAlgoId"] = client_id[:36]
+            return self._post("/fapi/v1/algoOrder", algo_params)
         if reduce_only:
             params["reduceOnly"] = "true"
         if client_id:
@@ -282,11 +321,6 @@ class BinanceFutures:
                 raise ValueError("LIMIT requires price")
             params["price"] = price
             params["timeInForce"] = "GTC"
-        if order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-            if stop_price is None:
-                raise ValueError(f"{order_type} requires stop_price")
-            params["stopPrice"] = stop_price
-            params["workingType"] = working_type
         return self._post("/fapi/v1/order", params)
 
     def get_order(self, symbol: str, client_id: str | None = None,

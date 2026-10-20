@@ -111,6 +111,41 @@ def test_klines_drop_unclosed_last_candle():
     assert len(out2) == 1 and out2[0]["close"] == 100.0
 
 
+def test_conditional_orders_route_to_algo_api():
+    """Regression (live testnet 2026-10-21): STOP_MARKET via
+    /fapi/v1/order is rejected with -4120 since Binance migrated
+    conditional orders to the Algo Order API. place_order must route
+    STOP_MARKET/TAKE_PROFIT_MARKET to /fapi/v1/algoOrder with
+    triggerPrice + newClientAlgoId, while LIMIT stays classic."""
+    from market import BinanceFutures
+    m = BinanceFutures(api_key="", api_secret="", testnet=True)
+    calls = []
+    m._post = lambda path, params=None: calls.append((path, params)) or {"ok": 1}
+
+    m.place_order("BNBUSDT", "SELL", 1.5, order_type="STOP_MARKET",
+                  stop_price=700.0, reduce_only=True, client_id="xsl")
+    path, params = calls[-1]
+    assert path == "/fapi/v1/algoOrder", path
+    assert params["algoType"] == "CONDITIONAL"
+    assert params["type"] == "STOP_MARKET"
+    assert params["triggerPrice"] == 700.0
+    assert params["newClientAlgoId"] == "xsl"
+    assert params["reduceOnly"] == "true"
+    assert "stopPrice" not in params and "newClientOrderId" not in params
+
+    m.place_order("BNBUSDT", "SELL", 1.5, order_type="TAKE_PROFIT_MARKET",
+                  stop_price=800.0, reduce_only=True, client_id="xtp")
+    path, params = calls[-1]
+    assert path == "/fapi/v1/algoOrder" and params["type"] == "TAKE_PROFIT_MARKET"
+
+    m.place_order("BNBUSDT", "BUY", 1.5, order_type="LIMIT", price=750.0,
+                  client_id="xentry")
+    path, params = calls[-1]
+    assert path == "/fapi/v1/order", path
+    assert params["price"] == 750.0 and params["timeInForce"] == "GTC"
+    assert params["newClientOrderId"] == "xentry"
+
+
 def test_equity_usdt_uses_margin_balance_not_available():
     """Regression (live testnet evidence 2026-10-21): the daily loss
     cap read availableBalance via balance_usdt(), so margin reserved
@@ -156,6 +191,7 @@ if __name__ == "__main__":
     test_mtf_weighted_partial_soft_support()
     test_mtf_hard_gate_rejects_when_1h_opposes()
     test_klines_drop_unclosed_last_candle()
+    test_conditional_orders_route_to_algo_api()
     test_equity_usdt_uses_margin_balance_not_available()
     test_equity_usdt_fallback_wallet_plus_upnl()
     print("engine fixes ok")
