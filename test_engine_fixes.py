@@ -2,8 +2,9 @@
 
 Covers: MTF set 1h/30m/15m/5m (user config 2026-10-21) — hard gate on
 1h, weighted score that can still reject when both soft legs oppose —
-and market.get_klines drops the still-forming last candle so analysis
-never repaints.
+market.get_klines drops the still-forming last candle so analysis
+never repaints, and market.equity_usdt returns margin balance (not
+available balance) for the daily loss cap.
 """
 
 import os
@@ -110,10 +111,51 @@ def test_klines_drop_unclosed_last_candle():
     assert len(out2) == 1 and out2[0]["close"] == 100.0
 
 
+def test_equity_usdt_uses_margin_balance_not_available():
+    """Regression (live testnet evidence 2026-10-21): the daily loss
+    cap read availableBalance via balance_usdt(), so margin reserved
+    by two pending LIMIT entries (4878.87 -> 3296.40 available) read
+    as a 32% 'loss' and tripped the 10% cap. equity_usdt must use
+    totalMarginBalance, which margin reservation does not move."""
+    from market import BinanceFutures
+    m = BinanceFutures(api_key="", api_secret="", testnet=True)
+
+    def fake_get(path, params=None, signed=False):
+        if path == "/fapi/v2/account":
+            return {"totalMarginBalance": "4873.50"}
+        raise AssertionError(f"unexpected path {path}")
+
+    m._get = fake_get
+    assert abs(m.equity_usdt() - 4873.50) < 1e-9
+
+
+def test_equity_usdt_fallback_wallet_plus_upnl():
+    from market import BinanceFutures
+    m = BinanceFutures(api_key="", api_secret="", testnet=True)
+
+    def fake_get(path, params=None, signed=False):
+        if path == "/fapi/v2/account":
+            raise RuntimeError("boom")
+        if path == "/fapi/v2/balance":
+            return [{"asset": "USDT", "balance": "4800.0",
+                     "availableBalance": "3200.0"}]
+        if path == "/fapi/v2/positionRisk":
+            return [{"symbol": "BTCUSDT", "positionAmt": "-0.006",
+                     "entryPrice": "82198.5", "unRealizedProfit": "-5.25",
+                     "leverage": "5"}]
+        raise AssertionError(f"unexpected path {path}")
+
+    m._get = fake_get
+    # wallet 4800 + uPnL -5.25 = 4794.75 — NOT the 3200 available balance
+    assert abs(m.equity_usdt() - 4794.75) < 1e-9
+
+
 if __name__ == "__main__":
     test_mtf_weighted_rejects_when_soft_legs_oppose()
     test_mtf_weighted_passes_when_all_aligned()
     test_mtf_weighted_partial_soft_support()
     test_mtf_hard_gate_rejects_when_1h_opposes()
     test_klines_drop_unclosed_last_candle()
+    test_equity_usdt_uses_margin_balance_not_available()
+    test_equity_usdt_fallback_wallet_plus_upnl()
     print("engine fixes ok")

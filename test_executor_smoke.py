@@ -40,6 +40,9 @@ class FakeMarket:
     def balance_usdt(self):
         return 1000.0
 
+    def equity_usdt(self):
+        return 1000.0
+
     def symbol_filters(self, symbol):
         return {"tickSize": 0.01, "stepSize": 0.001, "minQty": 0.001,
                 "pricePrecision": 2, "quantityPrecision": 3}

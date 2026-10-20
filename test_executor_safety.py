@@ -73,6 +73,9 @@ class FakeMarket:
     def balance_usdt(self):
         return self.balance
 
+    def equity_usdt(self):
+        return self.balance
+
     def symbol_filters(self, symbol):
         return dict(self.filters)
 

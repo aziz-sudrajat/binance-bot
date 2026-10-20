@@ -429,7 +429,7 @@ class Executor:
                      config.MAX_OPEN_POSITIONS)
             return None
 
-        equity = self.market.balance_usdt()
+        equity = self.market.equity_usdt()
         if equity <= 0:
             _release_claim()
             log.warning("no USDT balance")

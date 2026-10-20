@@ -192,6 +192,32 @@ class BinanceFutures:
                 return float(row.get("availableBalance") or row.get("balance") or 0)
         return 0.0
 
+    def equity_usdt(self) -> float:
+        """True account equity (margin balance): wallet + unrealised PnL.
+
+        Unlike balance_usdt() (available balance), this does NOT drop
+        when margin is reserved by pending orders or open positions, so
+        it is the correct basis for the daily loss cap and risk sizing.
+        (Available balance misread reserved margin as a loss: two
+        pending LIMIT entries once tripped the 10% daily cap and
+        blocked every remaining signal — live testnet evidence
+        2026-10-21.)"""
+        try:
+            acct = self._get("/fapi/v2/account", signed=True)
+            val = float(acct.get("totalMarginBalance") or 0)
+            if val > 0:
+                return val
+        except Exception:  # noqa: BLE001
+            pass
+        wallet = 0.0
+        data = self._get("/fapi/v2/balance", signed=True)
+        for row in data:
+            if row.get("asset") == "USDT":
+                wallet = float(row.get("balance") or 0)
+                break
+        upnl = sum(float(p.get("unrealized") or 0) for p in self.positions())
+        return wallet + upnl
+
     def positions(self) -> list[dict]:
         data = self._get("/fapi/v2/positionRisk", signed=True)
         open_pos = []
