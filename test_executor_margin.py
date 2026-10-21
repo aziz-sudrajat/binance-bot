@@ -133,6 +133,26 @@ def test_profit_take_skips_below_threshold_and_gone_positions():
         config.PROFIT_TAKE_PCT = 0.0
 
 
+def test_profit_take_uses_position_leverage_not_config():
+    # Position opened at 5x while config moved to 10x: margin must use
+    # the position's own leverage (250 x 2.0 / 5 = 100 -> 20% = 20).
+    config.PROFIT_TAKE_PCT = 20.0
+    config.MAX_LEVERAGE = 10
+    try:
+        m = FakeMarket()
+        m._positions = [{"symbol": "XRPUSDT", "amount": 250.0,
+                         "entry": 2.0, "unrealized": 20.0,
+                         "leverage": 5}]
+        ex = _executor(m)
+        ex.state["opened"] = {"XRPUSDT": {"direction": "LONG"}}
+        closed = ex.check_profit_take()
+        assert len(closed) == 1
+        assert m.placed[0]["side"] == "SELL"
+    finally:
+        config.PROFIT_TAKE_PCT = 0.0
+        config.MAX_LEVERAGE = 5
+
+
 def test_profit_take_disabled_by_default():
     config.PROFIT_TAKE_PCT = 0.0
     m = FakeMarket()

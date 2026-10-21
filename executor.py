@@ -548,8 +548,8 @@ class Executor:
         reaches PROFIT_TAKE_PCT% of its margin is full-closed at
         MARKET. The exchange TP1 order stays as backup. Positions
         that vanished from the exchange are left to reconcile_pending.
-        Margin is computed at MAX_LEVERAGE (uniform across managed
-        positions in this bot). Returns the closed records."""
+        Margin is computed at each position's own exchange leverage.
+        Returns the closed records."""
         pct = float(config.PROFIT_TAKE_PCT)
         if pct <= 0:
             return []
@@ -561,7 +561,6 @@ class Executor:
         except Exception as e:  # noqa: BLE001
             log.warning("profit-take: positions read failed: %s", e)
             return []
-        lev = max(1, int(config.MAX_LEVERAGE))
         closed = []
         for symbol, rec in list(opened.items()):
             p = live.get(symbol)
@@ -571,6 +570,11 @@ class Executor:
                 qty = abs(float(p["amount"]))
                 entry = float(p["entry"])
                 upnl = float(p["unrealized"])
+                # per-position leverage from the exchange (positions
+                # opened under an older leverage stay correct when
+                # MAX_LEVERAGE changes mid-flight)
+                lev = max(1, int(p.get("leverage") or
+                                 config.MAX_LEVERAGE))
             except (TypeError, ValueError):
                 continue
             margin = qty * entry / lev if entry > 0 else 0
