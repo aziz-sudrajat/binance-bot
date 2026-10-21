@@ -9,6 +9,8 @@ Usage:
   python main.py signals           # show fresh signals
   python main.py positions         # show open positions
   python main.py balance           # show USDT balance
+  python main.py settings          # show runtime settings
+  python main.py set <key> <value> # change a setting (applies next cycle)
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import sys
 import time
 
 import config
+import settings
 from executor import Executor
 from market import BinanceFutures
 from scanner import SignalStore, ensure_data_dir, run_scan
@@ -70,9 +73,9 @@ def cmd_run(_args) -> int:
 
 
 def cmd_loop(args) -> int:
-    interval = args.interval or config.SCAN_INTERVAL_SEC
     log = logging.getLogger("main")
-    log.info("loop every %ss mode=%s", interval, config.TRADE_MODE)
+    log.info("loop every %ss mode=%s",
+             args.interval or config.SCAN_INTERVAL_SEC, config.TRADE_MODE)
     ex = Executor()
     try:
         while True:
@@ -84,7 +87,9 @@ def cmd_loop(args) -> int:
                 return 0
             except Exception as e:  # noqa: BLE001
                 log.exception("loop error: %s", e)
-            time.sleep(interval)
+            # re-read each cycle so scan_interval_sec setting changes
+            # take effect without a restart
+            time.sleep(args.interval or config.SCAN_INTERVAL_SEC)
     finally:
         ex.close()
 
@@ -126,6 +131,25 @@ def cmd_balance(_args) -> int:
     return 0
 
 
+def cmd_settings(_args) -> int:
+    eff = settings.effective()
+    print(f"settings file: {settings.settings_path()}")
+    print("changes apply on the next loop cycle (no restart needed).")
+    for key in sorted(eff):
+        print(f"  {key} = {eff[key]}")
+    return 0
+
+
+def cmd_set(args) -> int:
+    try:
+        eff = settings.set_value(args.key, args.value)
+    except ValueError as e:
+        print(f"error: {e}")
+        return 2
+    print(f"{args.key} = {eff[args.key]} (applies next cycle)")
+    return 0
+
+
 def main() -> int:
     setup_logging()
     p = argparse.ArgumentParser(description="binance-bot LONG+SHORT futures")
@@ -139,6 +163,10 @@ def main() -> int:
     sub.add_parser("signals", help="list fresh signals")
     sub.add_parser("positions", help="list open positions")
     sub.add_parser("balance", help="show USDT balance")
+    sub.add_parser("settings", help="show runtime settings")
+    sp = sub.add_parser("set", help="change a runtime setting")
+    sp.add_argument("key", help="setting name (see: settings)")
+    sp.add_argument("value", help="new value")
 
     args = p.parse_args()
     cmds = {
@@ -149,6 +177,8 @@ def main() -> int:
         "signals": cmd_signals,
         "positions": cmd_positions,
         "balance": cmd_balance,
+        "settings": cmd_settings,
+        "set": cmd_set,
     }
     return cmds[args.cmd](args)
 

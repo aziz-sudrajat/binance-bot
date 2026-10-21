@@ -24,6 +24,7 @@ import time
 from decimal import Decimal, ROUND_DOWN
 
 import config
+import settings
 from market import BinanceFutures
 from scanner import SignalStore, ensure_data_dir
 
@@ -472,6 +473,15 @@ class Executor:
                      symbol, qty * entry, min_notional)
             return None
 
+        # ISOLATED is mandatory (user requirement): CROSS can never open,
+        # even if it somehow reaches the config — second enforcement
+        # layer behind the settings lock.
+        if str(config.MARGIN_MODE).upper() != "ISOLATED":
+            _release_claim()
+            log.error("abort %s: margin mode %s forbidden — ISOLATED only",
+                      symbol, config.MARGIN_MODE)
+            return None
+
         # margin/leverage setup is part of the trade's risk definition:
         # if it cannot be applied, the entry must not happen at all.
         try:
@@ -598,6 +608,8 @@ class Executor:
         return closed
 
     def process_fresh_signals(self) -> list[dict]:
+        # reload runtime settings every cycle (no restart needed)
+        settings.apply_to_config()
         ok, why = self.can_trade()
         if not ok:
             log.info("executor idle: %s", why)
