@@ -134,6 +134,12 @@ TP3_RR = 3.00
 # ---------------------------------------------------------------------------
 RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))  # % of equity per trade
 MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "5"))
+# Fixed-margin sizing + bot-side profit take (testnet setup 2026-10-21,
+# mirrors the live strict-bot model: fixed margin per entry, full close
+# at +PROFIT_TAKE_PCT% of margin). 0 = disabled: risk-based sizing and
+# no bot-side take (exchange TP1 stays as backup either way).
+FIXED_MARGIN_USD = float(os.environ.get("FIXED_MARGIN_USD", "0"))
+PROFIT_TAKE_PCT = float(os.environ.get("PROFIT_TAKE_PCT", "0"))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
 # Margin mode knob: default ISOLATED (crew standard — loss is contained
 # per position). MARGIN_MODE is the primary name; the older MARGIN_TYPE

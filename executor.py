@@ -117,7 +117,19 @@ class Executor:
     # -------------------------------------------------------------- sizing
     def position_qty(self, symbol: str, entry: float, stop: float,
                      equity: float) -> float:
-        """Risk-based size: risk_pct of equity / |entry-stop|."""
+        """Trade size. With FIXED_MARGIN_USD > 0: margin x leverage /
+        entry (the live strict-bot model — margin per entry is fixed,
+        so a full book of MAX_OPEN_POSITIONS trades always fits the
+        account). Otherwise risk-based: risk_pct of equity /
+        |entry-stop|."""
+        filt = self.market.symbol_filters(symbol)
+        if config.FIXED_MARGIN_USD > 0:
+            if entry <= 0:
+                return 0.0
+            lev = max(1, int(config.MAX_LEVERAGE))
+            raw_qty = config.FIXED_MARGIN_USD * lev / entry
+            qty = _round_step(raw_qty, filt["stepSize"])
+            return qty if qty >= filt["minQty"] else 0.0
         risk_frac = max(0.1, config.RISK_PCT) / 100.0
         risk_usd = equity * risk_frac
         stop_dist = abs(entry - stop)
@@ -125,7 +137,6 @@ class Executor:
             return 0.0
         raw_qty = risk_usd / stop_dist
         # leverage does not change notional risk formula above
-        filt = self.market.symbol_filters(symbol)
         qty = _round_step(raw_qty, filt["stepSize"])
         if qty < filt["minQty"]:
             return 0.0
@@ -531,12 +542,64 @@ class Executor:
         self._save_state()
         return rec
 
+    def check_profit_take(self) -> list[dict]:
+        """Bot-side profit take, checked every cycle (live strict-bot
+        semantics): any bot-managed position whose unrealized profit
+        reaches PROFIT_TAKE_PCT% of its margin is full-closed at
+        MARKET. The exchange TP1 order stays as backup. Positions
+        that vanished from the exchange are left to reconcile_pending.
+        Margin is computed at MAX_LEVERAGE (uniform across managed
+        positions in this bot). Returns the closed records."""
+        pct = float(config.PROFIT_TAKE_PCT)
+        if pct <= 0:
+            return []
+        opened = self.state.get("opened", {})
+        if not opened:
+            return []
+        try:
+            live = {p["symbol"]: p for p in self.market.positions()}
+        except Exception as e:  # noqa: BLE001
+            log.warning("profit-take: positions read failed: %s", e)
+            return []
+        lev = max(1, int(config.MAX_LEVERAGE))
+        closed = []
+        for symbol, rec in list(opened.items()):
+            p = live.get(symbol)
+            if not p:
+                continue
+            try:
+                qty = abs(float(p["amount"]))
+                entry = float(p["entry"])
+                upnl = float(p["unrealized"])
+            except (TypeError, ValueError):
+                continue
+            margin = qty * entry / lev if entry > 0 else 0
+            if margin <= 0 or upnl < margin * pct / 100.0:
+                continue
+            close_side = "SELL" if rec.get("direction") == "LONG" else "BUY"
+            try:
+                self.market.place_order(
+                    symbol, close_side, qty, order_type="MARKET",
+                    reduce_only=True,
+                    client_id=(f"pt{symbol}"[:20]))
+                log.info("profit-take %s: +%.2f on margin %.2f "
+                         "(%.1f%%) — closed", symbol, upnl, margin, pct)
+            except Exception as e:  # noqa: BLE001
+                log.error("profit-take %s failed: %s", symbol, e)
+                continue
+            opened.pop(symbol, None)
+            closed.append(rec)
+        if closed:
+            self._save_state()
+        return closed
+
     def process_fresh_signals(self) -> list[dict]:
         ok, why = self.can_trade()
         if not ok:
             log.info("executor idle: %s", why)
             return []
         results = list(self.reconcile_pending())
+        results.extend(self.check_profit_take())
         for sig in self.store.fresh(limit=10):
             rec = self.open_from_signal(sig)
             if rec:
