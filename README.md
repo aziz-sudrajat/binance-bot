@@ -55,6 +55,18 @@ python main.py loop --interval 600
 # Akun
 python main.py balance
 python main.py positions
+
+# Engine SPOT (swing, LONG-only, tanpa SL)
+python main.py spot-scan
+python main.py spot-trade
+python main.py spot-loop
+python main.py spot-loop --interval 900
+
+# Setting runtime (berlaku siklus berikutnya, tanpa restart)
+python main.py settings
+python main.py set leverage 20
+python main.py set tp_roi_pct 30
+python main.py set margin_usd 100
 ```
 
 ## Engine signal (ringkas)
@@ -70,6 +82,27 @@ volume 24h
   → quality ≥ MIN_QUALITY
   → SIGNAL LONG atau SHORT
 ```
+
+## Dua engine: futures + spot
+
+| | Futures (scalping harian) | Spot (swing) |
+|---|---|---|
+| Trigger | 15m | 1h |
+| MTF | 1h/30m/15m/5m (hard 1h) | 4h/1h/30m/15m (hard 4h) |
+| Arah | LONG + SHORT | LONG only (spot tidak bisa short) |
+| SL | STOP_MARKET via Algo Order | TIDAK ADA (spot tidak liquidasi) |
+| Exit | SL / TP1 exchange + profit-take bot | TP1 bot-side full close |
+| Sizing | margin fixed / risiko | USDT fixed per beli |
+| State | executor_state.json | spot_state.json |
+| Sinyal | signals.db | spot_signals.db |
+
+Spot memakai struktur pasar HH/HL sebagai gate + pattern candle
+(bullish engulfing, hammer) sebagai bonus quality. Kunci spot
+TERPISAH dari kunci futures: kunci spot testnet dari
+testnet.binance.vision (`SPOT_API_KEY`/`SPOT_API_SECRET`), bukan
+kunci futures testnet. Batas v1 spot: full close di TP1 saja (TP2
+tercatat untuk partial-exit berikutnya), belum ada exit reversal,
+fee 0,1% tidak dimodelkan.
 
 ## Risk
 

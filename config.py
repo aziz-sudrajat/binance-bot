@@ -180,4 +180,24 @@ KILL_FILE_NAME = "KILL"
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 SIGNALS_DB = os.path.join(DATA_DIR, "signals.db")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+# Spot engine (dual-engine 2026-10-21): LONG-only swing trading.
+# Spot keys are SEPARATE from futures keys: spot testnet keys come from
+# testnet.binance.vision, NOT the futures testnet. No leverage, no
+# margin, no SL (spot cannot liquidate — positions are held to TP).
+SPOT_MODE = os.environ.get("SPOT_MODE", "testnet")  # testnet | live
+SPOT_API_KEY = os.environ.get("SPOT_API_KEY", "")
+SPOT_API_SECRET = os.environ.get("SPOT_API_SECRET", "")
+SPOT_TESTNET_BASE = "https://testnet.binance.vision"
+SPOT_LIVE_BASE = "https://api.binance.com"
+SPOT_TRADE_USDT = float(os.environ.get("SPOT_TRADE_USDT", "100"))
+SPOT_TP1_ATR = float(os.environ.get("SPOT_TP1_ATR", "2.0"))
+SPOT_TP2_ATR = float(os.environ.get("SPOT_TP2_ATR", "4.0"))
+SPOT_MIN_QUALITY = int(os.environ.get("SPOT_MIN_QUALITY", "62"))
+SPOT_TOP_N = int(os.environ.get("SPOT_TOP_N", "40"))
+SPOT_SIGNALS_DB = os.path.join(DATA_DIR, "spot_signals.db")
+SPOT_STATE_FILE = os.path.join(DATA_DIR, "spot_state.json")
+# Spot MTF: 4h hard trend gate, weighted 4h/1h/30m/15m.
+SPOT_MTF_WEIGHTS = {"4h": 0.40, "1h": 0.25, "30m": 0.20, "15m": 0.15}
+SPOT_MTF_MIN_SCORE = 0.70
 LOG_FILE = os.path.join(DATA_DIR, "bot.log")

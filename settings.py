@@ -34,6 +34,11 @@ _SPECS = {
     "daily_loss_cap_pct": ("DAILY_LOSS_CAP_PCT", "float", 0, 100),
     "btc_align": ("BTC_ALIGN", "bool", None, None),
     "scan_interval_sec": ("SCAN_INTERVAL_SEC", "int", 60, 86400),
+    # spot engine knobs (dual-engine 2026-10-21)
+    "spot_trade_usd": ("SPOT_TRADE_USDT", "float", 1, 1_000_000),
+    "spot_tp1_atr": ("SPOT_TP1_ATR", "float", 0.5, 20),
+    "spot_tp2_atr": ("SPOT_TP2_ATR", "float", 0.5, 40),
+    "spot_min_quality": ("SPOT_MIN_QUALITY", "int", 0, 100),
     # kill_switch is special: it drives the KILL file, not a config attr.
     "kill_switch": (None, "bool", None, None),
 }

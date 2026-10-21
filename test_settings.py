@@ -96,6 +96,18 @@ def test_effective_overlay_and_apply():
     assert os.path.exists(settings.settings_path())
 
 
+def test_spot_settings_keys():
+    _fresh_tmp()
+    assert settings.set_value("spot_trade_usd", "250")["spot_trade_usd"] == 250.0
+    assert settings.set_value("spot_tp1_atr", "3")["spot_tp1_atr"] == 3.0
+    try:
+        settings.set_value("spot_trade_usd", "0")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("spot_trade_usd 0 should fail")
+
+
 def test_kill_switch_drives_kill_file():
     tmp = _fresh_tmp()
     kill_path = os.path.join(tmp, config.KILL_FILE_NAME)

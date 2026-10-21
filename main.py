@@ -11,6 +11,9 @@ Usage:
   python main.py balance           # show USDT balance
   python main.py settings          # show runtime settings
   python main.py set <key> <value> # change a setting (applies next cycle)
+  python main.py spot-scan         # one spot swing scan pass
+  python main.py spot-trade        # buy spot from fresh signals
+  python main.py spot-loop         # continuous spot scan+trade
 """
 
 from __future__ import annotations
@@ -131,6 +134,58 @@ def cmd_balance(_args) -> int:
     return 0
 
 
+def cmd_spot_scan(_args) -> int:
+    from spot_engine import run_spot_scan
+
+    stats = run_spot_scan()
+    print(json.dumps({k: v for k, v in stats.items() if k != "signals"}, indent=2))
+    if stats.get("signals"):
+        print("\nSpot approved:")
+        for s in stats["signals"]:
+            print(f"  LONG {s['symbol']:12} Q={s['quality']} entry={s['entry']} "
+                  f"tp1={s['tp1']:.6g} structure={s.get('structure')} "
+                  f"patterns={s.get('patterns')}")
+    return 0
+
+
+def cmd_spot_trade(_args) -> int:
+    from spot_executor import SpotExecutor
+
+    ex = SpotExecutor()
+    try:
+        recs = ex.process_spot_signals()
+    finally:
+        ex.close()
+    print(json.dumps(recs, indent=2, default=str))
+    return 0
+
+
+def cmd_spot_loop(args) -> int:
+    from spot_engine import run_spot_scan
+    from spot_executor import SpotExecutor
+
+    log = logging.getLogger("main")
+    if not config.SPOT_API_KEY:
+        log.warning("no SPOT_API_KEY — spot loop runs scan-only until "
+                    "spot keys are provided")
+    log.info("spot loop every %ss mode=%s",
+             args.interval or config.SCAN_INTERVAL_SEC, config.SPOT_MODE)
+    ex = SpotExecutor()
+    try:
+        while True:
+            try:
+                run_spot_scan()
+                ex.process_spot_signals()
+            except KeyboardInterrupt:
+                log.info("spot loop stopped")
+                return 0
+            except Exception as e:  # noqa: BLE001
+                log.exception("spot loop error: %s", e)
+            time.sleep(args.interval or config.SCAN_INTERVAL_SEC)
+    finally:
+        ex.close()
+
+
 def cmd_settings(_args) -> int:
     eff = settings.effective()
     print(f"settings file: {settings.settings_path()}")
@@ -164,6 +219,10 @@ def main() -> int:
     sub.add_parser("positions", help="list open positions")
     sub.add_parser("balance", help="show USDT balance")
     sub.add_parser("settings", help="show runtime settings")
+    sub.add_parser("spot-scan", help="run one spot swing scan")
+    sub.add_parser("spot-trade", help="buy spot from fresh signals")
+    sl = sub.add_parser("spot-loop", help="continuous spot scan+trade")
+    sl.add_argument("--interval", type=int, default=None)
     sp = sub.add_parser("set", help="change a runtime setting")
     sp.add_argument("key", help="setting name (see: settings)")
     sp.add_argument("value", help="new value")
@@ -179,6 +238,9 @@ def main() -> int:
         "balance": cmd_balance,
         "settings": cmd_settings,
         "set": cmd_set,
+        "spot-scan": cmd_spot_scan,
+        "spot-trade": cmd_spot_trade,
+        "spot-loop": cmd_spot_loop,
     }
     return cmds[args.cmd](args)
 
