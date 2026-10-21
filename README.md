@@ -1,20 +1,22 @@
 # binance-bot
 
-Tools sederhana: **scanner sinyal LONG + SHORT** + **auto-trading Binance USDT-M Futures**.
+![binance-bot demo](assets/demo.gif)
 
-Dirancang ulang dari nol — fokus engine sinyal bidirectional, bukan port penuh bot lama.
+A simple toolset: **LONG + SHORT signal scanner** + **Binance USDT-M Futures auto-trading** — plus a **spot swing engine** in the same repo.
 
-## Fitur
+Rebuilt from scratch — focused on a bidirectional signal engine, not a full port of the old bot.
 
-- **LONG dan SHORT** (default `BULLISH_ONLY=False`)
-- Setup 15m: EMA 9/21/50, RSI, MACD, volume
+## Features
+
+- **LONG and SHORT** (default `BULLISH_ONLY=False`)
+- 15m setups: EMA 9/21/50, RSI, MACD, volume
 - **Noise filter**: Efficiency Ratio, doji, direction flips, DI conflict, overextension
-- **MTF weighted**: hard gate 1h, skor weighted 1h/30m/15m/5m ≥ 0.70
-- **BTC align** opsional (15m)
+- **MTF weighted**: hard 1h gate, weighted 1h/30m/15m/5m score ≥ 0.70
+- Optional **BTC align** (15m)
 - Freshness vs entry zone
 - Quality score ≥ `MIN_QUALITY`
 - Auto entry LIMIT/MARKET + STOP_MARKET SL + TAKE_PROFIT_MARKET TP1
-- Mode: `paper` | `testnet` | `live`
+- Modes: `paper` | `testnet` | `live`
 
 ## Install
 
@@ -24,127 +26,122 @@ python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env — isi API key testnet
+# edit .env — fill in your testnet API key
 ```
 
-Load env (opsional):
+Load env (optional):
 
 ```bash
 export $(grep -v '^#' .env | xargs)
 ```
 
-## Perintah
+## Commands
 
 ```bash
-# Satu kali scan (public data, API key tidak wajib)
+# One scan pass (public data, no API key required)
 python main.py scan
 
-# Lihat sinyal fresh
+# Show fresh signals
 python main.py signals
 
-# Auto-trade dari sinyal (butuh key testnet/live)
+# Auto-trade from signals (needs testnet/live keys)
 python main.py trade
 
-# Scan + trade sekali
+# Scan + trade once
 python main.py run
 
-# Loop terus (default 15 menit)
+# Continuous loop (default 15 minutes)
 python main.py loop
 python main.py loop --interval 600
 
-# Akun
+# Account
 python main.py balance
 python main.py positions
 
-# Engine SPOT (swing, LONG-only, tanpa SL)
+# SPOT engine (swing, LONG-only, no SL)
 python main.py spot-scan
 python main.py spot-trade
 python main.py spot-loop
 python main.py spot-loop --interval 900
 
-# Setting runtime (berlaku siklus berikutnya, tanpa restart)
+# Runtime settings (apply on the next cycle, no restart)
 python main.py settings
 python main.py set leverage 20
 python main.py set tp_roi_pct 30
 python main.py set margin_usd 100
 ```
 
-## Engine signal (ringkas)
+## Signal engine (summary)
 
 ```
-volume 24h
+24h volume
   → 15m BULLISH/BEARISH WATCH (strength ≥ 3)
   → regime brake (RANGING = no-trade zone, REGIME_BLOCK_RANGING)
   → noise filter
-  → MTF (1h hard, weighted score ≥ 0.70 dari leg tren EMA 1h/30m/15m/5m)
-  → BTC align (opsional: vote 15m + tren 1h tidak boleh melawan)
-  → freshness live price
+  → MTF (1h hard, weighted score ≥ 0.70 from EMA-trend legs 1h/30m/15m/5m)
+  → BTC align (optional: 15m vote + 1h trend must not oppose)
+  → live-price freshness
   → quality ≥ MIN_QUALITY
-  → SIGNAL LONG atau SHORT
+  → LONG or SHORT SIGNAL
 ```
 
-## Dua engine: futures + spot
+## Two engines: futures + spot
 
-| | Futures (scalping harian) | Spot (swing) |
+| | Futures (daily scalping) | Spot (swing) |
 |---|---|---|
 | Trigger | 15m | 1h |
 | MTF | 1h/30m/15m/5m (hard 1h) | 4h/1h/30m/15m (hard 4h) |
-| Arah | LONG + SHORT | LONG only (spot tidak bisa short) |
-| SL | STOP_MARKET via Algo Order | TIDAK ADA (spot tidak liquidasi) |
-| Exit | SL / TP1 exchange + profit-take bot | TP1 bot-side full close |
-| Sizing | margin fixed / risiko | USDT fixed per beli |
+| Direction | LONG + SHORT | LONG only (spot cannot short) |
+| SL | STOP_MARKET via Algo Order | NONE (spot cannot liquidate) |
+| Exit | SL / exchange TP1 + bot profit-take | Bot-side TP1 full close |
+| Sizing | Fixed margin / risk | Fixed USDT per buy |
 | State | executor_state.json | spot_state.json |
-| Sinyal | signals.db | spot_signals.db |
+| Signals | signals.db | spot_signals.db |
 
-Spot memakai struktur pasar HH/HL sebagai gate + pattern candle
-(bullish engulfing, hammer) sebagai bonus quality. Kunci spot
-TERPISAH dari kunci futures: kunci spot testnet dari
-testnet.binance.vision (`SPOT_API_KEY`/`SPOT_API_SECRET`), bukan
-kunci futures testnet. Batas v1 spot: full close di TP1 saja (TP2
-tercatat untuk partial-exit berikutnya), belum ada exit reversal,
-fee 0,1% tidak dimodelkan.
+Spot uses HH/HL market structure as a gate plus candle patterns
+(bullish engulfing, hammer) as a quality bonus. Spot keys are
+SEPARATE from futures keys: spot testnet keys come from
+testnet.binance.vision (`SPOT_API_KEY`/`SPOT_API_SECRET`), not from
+the futures testnet. Spot v1 limits: full close at TP1 only (TP2 is
+recorded for a future partial-exit), no reversal exit yet, and the
+0.1% fee is not modeled.
 
 ## Risk
 
-- Default **testnet**. Live hanya jika `TRADE_MODE=live` **dan** `LIVE_CONFIRM=YES`.
-- Size = `RISK_PCT%` equity / jarak entry−stop.
-- Max posisi terbuka: `MAX_OPEN_POSITIONS`.
-- Margin default **ISOLATED** (`MARGIN_MODE`). Gagal set margin/leverage = entry dibatalkan.
-- SL/TP dipasang **setelah entry terisi** (LIMIT ditunggu/dipoll; belum terisi → dicatat
-  sebagai pending dan direkonsiliasi di pass berikutnya; pending lewat `ORDER_TTL_SEC`
-  dibatalkan). Jika SL gagal dipasang setelah fill (3x retry), posisi **ditutup darurat**
-  via market reduce-only — tidak ada posisi telanjang yang dibiarkan.
-- **Kill switch**: buat file `KILL` di folder `data/` → semua entry baru terblokir.
-- **Batas rugi harian**: entry terblokir bila equity turun > `DAILY_LOSS_CAP_PCT%`
-  dari equity awal hari (dicatat di `executor_state.json`).
-- Entry diskip bila notional (qty × harga) di bawah MIN_NOTIONAL exchange /
-  `MIN_NOTIONAL_USDT`.
+- Default is **testnet**. Live only when `TRADE_MODE=live` **and** `LIVE_CONFIRM=YES`.
+- Size = `RISK_PCT%` of equity / entry−stop distance.
+- Max open positions: `MAX_OPEN_POSITIONS`.
+- Default margin is **ISOLATED** (`MARGIN_MODE`). A failed margin/leverage set cancels the entry.
+- SL/TP are attached **after the entry fills** (LIMIT fills are waited on/polled; unfilled orders are recorded as pending and reconciled on the next pass; pending orders past `ORDER_TTL_SEC` are cancelled). If SL cannot be attached after a fill (3 retries), the position is **emergency-closed** via market reduce-only — no naked position is ever left open.
+- **Kill switch**: create a `KILL` file in the `data/` folder → all new entries are blocked.
+- **Daily loss cap**: entries are blocked when equity drops more than `DAILY_LOSS_CAP_PCT%` from the start-of-day equity (recorded in `executor_state.json`).
+- Entries are skipped when notional (qty × price) is below the exchange MIN_NOTIONAL / `MIN_NOTIONAL_USDT`.
 
-## File data
+## Data files
 
 ```
-data/signals.db      # sinyal
-data/state.json      # ringkasan scan terakhir
+data/signals.db      # signals
+data/state.json      # last scan summary
 data/executor_state.json
 data/bot.log
 ```
 
-## Konfigurasi penting
+## Key configuration
 
-| Env / config | Default | Arti |
-|--------------|---------|------|
+| Env / config | Default | Meaning |
+|--------------|---------|---------|
 | `TRADE_MODE` | testnet | paper / testnet / live |
 | `BULLISH_ONLY` | False | False = LONG+SHORT |
-| `MIN_QUALITY` | 62 | gerbang kualitas |
-| `BTC_ALIGN` | 1 | arah BTC harus sama |
+| `MIN_QUALITY` | 62 | quality gate |
+| `BTC_ALIGN` | 1 | BTC direction must agree |
 | `RISK_PCT` | 1.0 | % equity per trade |
 | `MAX_LEVERAGE` | 5 | leverage |
 | `MARGIN_MODE` | ISOLATED | ISOLATED / CROSSED |
-| `MIN_NOTIONAL_USDT` | 5 | notional minimum per entry |
-| `DAILY_LOSS_CAP_PCT` | 10 | blokir entry bila equity harian turun melewati % ini |
-| `ORDER_TTL_SEC` | 1800 | umur maks order LIMIT pending sebelum dibatalkan |
-| `UNIVERSE` | top | top volume atau list |
+| `MIN_NOTIONAL_USDT` | 5 | minimum notional per entry |
+| `DAILY_LOSS_CAP_PCT` | 10 | block entries when daily equity drops past this % |
+| `ORDER_TTL_SEC` | 1800 | max age of a pending LIMIT order before cancellation |
+| `UNIVERSE` | top | top volume or a list |
 
 ## Disclaimer
 
-Ini tools edukasi/otomasi. Trading futures berisiko tinggi. Uji di **testnet** dulu. Tidak ada jaminan profit.
+Educational/automation tooling. Futures trading is high risk. Test on **testnet** first. No profit is guaranteed.

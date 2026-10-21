@@ -127,6 +127,7 @@ def test_spot_top_symbols_filters_stables_and_leveraged():
     tickers = [
         {"symbol": "BTCUSDT", "quoteVolume": "100000000"},
         {"symbol": "USDCUSDT", "quoteVolume": "90000000"},
+        {"symbol": "USD1USDT", "quoteVolume": "85000000"},
         {"symbol": "BTCUPUSDT", "quoteVolume": "80000000"},
         {"symbol": "ETHUSDT", "quoteVolume": "50000000"},
         {"symbol": "LOWUSDT", "quoteVolume": "10"},

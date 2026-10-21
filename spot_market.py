@@ -25,7 +25,7 @@ import config
 log = logging.getLogger("spot_market")
 
 _STABLE_BASES = {"USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BUSD",
-                 "EUR", "GBP", "TRY", "BRL", "AUD"}
+                 "USD1", "EUR", "GBP", "TRY", "BRL", "AUD"}
 _LEV_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 
